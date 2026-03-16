@@ -1,0 +1,1090 @@
+# Example ESP32 configuration (Uncomment and customize for your board)
+# esp32:
+#   board: esp32dev
+#   framework:
+#     type: esp-idf         # REQUIRED: esp-idf is mandatory for this BLE implementation
+
+# Example Basic Settings (Uncomment and customize)
+# wifi:
+#   ssid: "YOUR_SSID"
+#   password: "YOUR_PASSWORD"
+
+# api:
+#   encryption:
+#     key: "YOUR_API_KEY"
+
+# ota:
+#   - platform: esphome
+#     password: "YOUR_OTA_PASSWORD"
+
+
+logger:
+  level: ${log_level}
+
+esp32_ble_tracker:     
+  scan_parameters:    
+    active: true
+
+# ============================================================
+# Boot
+# ============================================================
+esphome:
+  on_boot:
+    priority: -100
+    then:
+      - delay: 5s
+      - if:
+          condition:
+            lambda: 'return id(${desk_id}_ble_enabled);'
+          then:
+            - ble_client.connect: ${desk_id}_ble_client
+# ============================================================
+# LINAK DPI1C Desk BLE Control for ESPHome (v2 — HCI 로그 기반)
+# Controller: DPI1C000011006 / MAC: 
+# ============================================================
+# HCI 스누프 로그에서 밝혀진 프로토콜:
+#
+# [이동] 0x003C (svc 0030 / chr 0031) ← 목표 raw height 반복 전송
+#        raw = (목표cm - 60.0) × 100
+# [정지] 0x0010 (svc 0001 / chr 0002) ← FF 00
+# [HB]   0x003C (svc 0030 / chr 0031) ← 01 80 (주기적)
+# [Init] 0x0016 (svc 0010 / chr 0011) ← 7F 80 00 → 7F 26 00 → 7F 81 00
+# [이름] 0x0016 ← 7F 26 00 → 응답 01 06 [ASCII]
+# [프리셋 읽기] 0x0016 ← 7F 99 00 [slot] → 응답 01 05 [slot] 01 01 [h_lo] [h_hi]
+# [높이] 0x001F (svc 0020 / chr 0021) notify → [h_lo, h_hi, spd_lo, spd_hi]
+# ============================================================
+# ============================================================
+
+globals:
+  - id: ${desk_id}_move_after
+    type: uint32_t
+    initial_value: '0'
+
+  - id: ${desk_id}_stall_since
+    type: uint32_t
+    initial_value: '0'
+
+  - id: ${desk_id}_setting_enabled
+    type: bool
+    initial_value: 'false'
+  - id: ${desk_id}_lock_mode
+    type: uint8_t
+    initial_value: '1'
+  - id: ${desk_id}_lock_timeout
+    type: uint8_t
+    initial_value: '10'
+
+  - id: ${desk_id}_is_moving
+    type: bool
+    initial_value: 'false'
+  - id: ${desk_id}_height_value
+    type: float
+    initial_value: '0.0'
+  - id: ${desk_id}_target_raw
+    type: uint16_t
+    initial_value: '0xFFFF'
+  - id: ${desk_id}_moving_to_target
+    type: bool
+    initial_value: 'false'
+  - id: ${desk_id}_ble_enabled
+    type: bool
+    initial_value: 'true'
+  - id: ${desk_id}_notify_registered
+    type: bool
+    initial_value: 'false'
+
+  # GATT handles
+  - id: ${desk_id}_handle_ctrl
+    type: uint16_t
+    initial_value: '0'
+  - id: ${desk_id}_handle_0011
+    type: uint16_t
+    initial_value: '0'
+  - id: ${desk_id}_handle_0021
+    type: uint16_t
+    initial_value: '0'
+  - id: ${desk_id}_handle_move
+    type: uint16_t
+    initial_value: '0'
+
+  # 프리셋 높이 (raw 값, 0xFFFF = 미설정)
+  - id: ${desk_id}_preset_0_raw
+    type: uint16_t
+    initial_value: '0xFFFF'
+    restore_value: true
+  - id: ${desk_id}_preset_1_raw
+    type: uint16_t
+    initial_value: '0xFFFF'
+    restore_value: true
+  - id: ${desk_id}_preset_2_raw
+    type: uint16_t
+    initial_value: '0xFFFF'
+    restore_value: true
+  - id: ${desk_id}_preset_3_raw
+    type: uint16_t
+    initial_value: '0xFFFF'
+    restore_value: true
+
+# ============================================================
+# Scripts
+# ============================================================
+script:
+  # ── Init 시퀀스 (연결 후 1회) ──
+  - id: ${desk_id}_init_sequence
+    mode: restart
+    then:
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected()) return;
+          auto gattc_if = id(${desk_id}_ble_client)->get_gattc_if();
+          auto conn_id  = id(${desk_id}_ble_client)->get_conn_id();
+
+          // 최초 높이 읽기
+          if (id(${desk_id}_handle_0021) != 0) {
+            esp_ble_gattc_read_char(gattc_if, conn_id, id(${desk_id}_handle_0021), ESP_GATT_AUTH_REQ_NO_MITM);
+            ESP_LOGD("init", "Initial height READ request");
+          }
+      - delay: 2s
+
+      # CCCD 등록
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected()) return;
+          auto gattc_if = id(${desk_id}_ble_client)->get_gattc_if();
+          auto conn_id  = id(${desk_id}_ble_client)->get_conn_id();
+          uint8_t en[] = {0x01, 0x00};
+
+          uint16_t handles[] = { id(${desk_id}_handle_0021), id(${desk_id}_handle_0011) };
+          const char* names[] = { "0021", "0011" };
+          for (int i = 0; i < 2; i++) {
+            if (handles[i] == 0) continue;
+            esp_ble_gattc_register_for_notify(gattc_if, id(${desk_id}_ble_client)->get_remote_bda(), handles[i]);
+            uint16_t cccd = handles[i] + 1;
+            esp_ble_gattc_write_char_descr(gattc_if, conn_id, cccd, sizeof(en), en,
+              ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+            ESP_LOGD("init", "CCCD registered: %s (handle=0x%04X)", names[i], handles[i]);
+          }
+          id(${desk_id}_notify_registered) = true;
+      - delay: 300ms
+
+      # Init 1/3: 7F 80 00
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) return;
+          uint8_t cmd[] = {0x7F, 0x80, 0x00};
+          esp_ble_gattc_write_char(id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGD("init", "Init 1/3: 7F 80 00");
+      - delay: 300ms
+
+      # Init 2/3: 이름 요청 7F 26 00
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) return;
+          uint8_t cmd[] = {0x7F, 0x26, 0x00};
+          esp_ble_gattc_write_char(id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGD("init", "Init 2/3: 7F 26 00");
+      - delay: 300ms
+
+      # Init 3/3: 7F 81 00
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) return;
+          uint8_t cmd[] = {0x7F, 0x81, 0x00};
+          esp_ble_gattc_write_char(id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGD("init", "Init 3/3: 7F 81 00");
+      - delay: 300ms
+
+      # 키잠금 설정 읽기
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) return;
+          uint8_t cmd[] = {0x7F, 0x3F, 0x00};
+          esp_ble_gattc_write_char(id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGD("init", "Read key lock settings");
+      - delay: 300ms
+
+      # 프리셋 slot 0~3 읽기 (비동기 delay 사용)
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) return;
+          uint8_t cmd[] = {0x7F, 0x99, 0x00, 0x00};
+          esp_ble_gattc_write_char(id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGD("init", "Read preset slot 0");
+      - delay: 200ms
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) return;
+          uint8_t cmd[] = {0x7F, 0x99, 0x00, 0x01};
+          esp_ble_gattc_write_char(id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGD("init", "Read preset slot 1");
+      - delay: 200ms
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) return;
+          uint8_t cmd[] = {0x7F, 0x99, 0x00, 0x02};
+          esp_ble_gattc_write_char(id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGD("init", "Read preset slot 2");
+      - delay: 200ms
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) return;
+          uint8_t cmd[] = {0x7F, 0x99, 0x00, 0x03};
+          esp_ble_gattc_write_char(id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGD("init", "Read preset slot 3");
+
+  # ── 이동 루프 ──
+  - id: ${desk_id}_move_loop
+    mode: restart
+    then:
+      - while:
+          condition:
+            lambda: 'return id(${desk_id}_moving_to_target) && id(${desk_id}_ble_client)->connected();'
+          then:
+            - lambda: |-
+                if (millis() < id(${desk_id}_move_after)) return;
+                if (id(${desk_id}_handle_move) == 0 || id(${desk_id}_handle_ctrl) == 0) {
+                  id(${desk_id}_moving_to_target) = false;
+                  return;
+                }
+
+                uint16_t target_raw = id(${desk_id}_target_raw);
+                float target_cm = 60.0 + (target_raw / 100.0);
+                float current = id(${desk_id}_height_value);
+                float speed_now = std::abs(id(${desk_id}_speed).state);
+                float distance = std::abs(target_cm - current);
+
+                if (speed_now < 0.1) {
+                  if (distance < 0.5) {
+                    // 정상 도착
+                    id(${desk_id}_moving_to_target) = false;
+                    id(${desk_id}_is_moving) = false;
+                    if (id(${desk_id}_ble_client)->connected()) {
+                      uint8_t stop[] = {0xFF, 0x00};
+                      esp_ble_gattc_write_char(
+                        id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+                        id(${desk_id}_handle_ctrl), sizeof(stop), stop,
+                        ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+                    }
+                    id(${desk_id}_target_height).publish_state(roundf(current * 10) / 10.0);
+                    ESP_LOGI("moving", "Arrived! Target=%.1f Current=%.1f", target_cm, current);
+                    return;
+                  }
+
+                  // 목표 미도달 + 정지 = stall (물리버튼/E16 등)
+                  if (id(${desk_id}_stall_since) == 0) {
+                    id(${desk_id}_stall_since) = millis();
+                  } else if (millis() - id(${desk_id}_stall_since) > 1500) {
+                    id(${desk_id}_moving_to_target) = false;
+                    id(${desk_id}_is_moving) = false;
+                    id(${desk_id}_stall_since) = 0;
+                    id(${desk_id}_target_height).publish_state(roundf(current * 10) / 10.0);
+                    ESP_LOGW("moving", "⏹️ Stop detected -> Aborting move (Target=%.1f Current=%.1f)", target_cm, current);
+                    return;
+                  }
+                } else {
+                  id(${desk_id}_stall_since) = 0;
+                }
+
+                // 이동 명령 전송
+                if (!id(${desk_id}_ble_client)->connected()) {
+                  id(${desk_id}_moving_to_target) = false;
+                  return;
+                }
+                uint8_t val[] = {(uint8_t)(target_raw & 0xFF), (uint8_t)(target_raw >> 8)};
+                auto ret = esp_ble_gattc_write_char(
+                  id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+                  id(${desk_id}_handle_move), sizeof(val), val,
+                  ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+                if (ret != ESP_OK) {
+                  ESP_LOGW("moving", "BLE write failed (0x%X) -> Aborting move", ret);
+                  id(${desk_id}_moving_to_target) = false;
+                }
+            - delay: 50ms
+      - lambda: |-
+          id(${desk_id}_stall_since) = 0;
+
+  # ── 키잠금 설정 다시 읽기 ──
+  - id: ${desk_id}_read_lock_setting
+    mode: single
+    then:
+      - delay: 300ms
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) return;
+          uint8_t rd[] = {0x7F, 0x3F, 0x00};
+          esp_ble_gattc_write_char(
+            id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(rd), rd,
+            ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+
+  # ── 프리셋 이동 (slot 파라미터) ──
+  - id: ${desk_id}_preset_move
+    parameters:
+      slot: int
+    then:
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_move) == 0) return;
+          uint16_t raw = 0xFFFF;
+          if (slot == 0) raw = id(${desk_id}_preset_0_raw);
+          else if (slot == 1) raw = id(${desk_id}_preset_1_raw);
+          else if (slot == 2) raw = id(${desk_id}_preset_2_raw);
+          else if (slot == 3) raw = id(${desk_id}_preset_3_raw);
+          if (raw == 0xFFFF) { ESP_LOGW("preset", "Preset %d not loaded", slot + 1); return; }
+          id(${desk_id}_target_raw) = raw;
+          id(${desk_id}_moving_to_target) = true;
+          id(${desk_id}_is_moving) = true;
+          id(${desk_id}_move_after) = millis();
+          uint8_t val[] = {(uint8_t)(raw & 0xFF), (uint8_t)(raw >> 8)};
+          esp_ble_gattc_write_char(
+            id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_move), sizeof(val), val,
+            ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGI("preset", "Preset %d → raw=%d (%.1fcm)", slot + 1, raw, 60.0 + raw/100.0);
+      - script.execute: ${desk_id}_move_loop
+
+  # ── 프리셋 저장 (slot 파라미터) ──
+  - id: ${desk_id}_preset_save
+    parameters:
+      slot: int
+    then:
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) {
+            ESP_LOGW("status", "Not connected"); return;
+          }
+          float cm = id(${desk_id}_height_value);
+          uint16_t raw = (uint16_t)((cm - 60.0) * 100.0);
+          if (slot == 0) { id(${desk_id}_preset_0_raw) = raw; id(${desk_id}_preset_0_height).publish_state(cm); }
+          else if (slot == 1) { id(${desk_id}_preset_1_raw) = raw; id(${desk_id}_preset_1_height).publish_state(cm); }
+          else if (slot == 2) { id(${desk_id}_preset_2_raw) = raw; id(${desk_id}_preset_2_height).publish_state(cm); }
+          else if (slot == 3) { id(${desk_id}_preset_3_raw) = raw; id(${desk_id}_preset_3_height).publish_state(cm); }
+          uint8_t cmd[] = {0x7F, 0x99, 0x80, (uint8_t)slot, 0x01, 0x01, (uint8_t)(raw & 0xFF), (uint8_t)(raw >> 8)};
+          esp_ble_gattc_write_char(id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGI("preset", "Save Preset %d: %.1fcm (raw=%d)", slot + 1, cm, raw);
+
+  # ── 프리셋 삭제 (slot 파라미터) ──
+  - id: ${desk_id}_preset_delete
+    parameters:
+      slot: int
+    then:
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) {
+            ESP_LOGW("status", "Not connected"); return;
+          }
+          if (slot == 0) { id(${desk_id}_preset_0_raw) = 0xFFFF; id(${desk_id}_preset_0_height).publish_state(NAN); }
+          else if (slot == 1) { id(${desk_id}_preset_1_raw) = 0xFFFF; id(${desk_id}_preset_1_height).publish_state(NAN); }
+          else if (slot == 2) { id(${desk_id}_preset_2_raw) = 0xFFFF; id(${desk_id}_preset_2_height).publish_state(NAN); }
+          else if (slot == 3) { id(${desk_id}_preset_3_raw) = 0xFFFF; id(${desk_id}_preset_3_height).publish_state(NAN); }
+          uint8_t cmd[] = {0x7F, 0x99, 0x80, (uint8_t)slot, 0x01, 0x00};
+          esp_ble_gattc_write_char(id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGI("preset", "Delete Preset %d", slot + 1);
+
+  # ── 부팅 시 저장된 프리셋 값 복원 ──
+  - id: ${desk_id}_restore_presets
+    mode: single
+    then:
+      - lambda: |-
+          // Flash에서 복원된 preset raw 값을 template sensor에 publish
+          uint16_t raws[] = {
+            id(${desk_id}_preset_0_raw),
+            id(${desk_id}_preset_1_raw),
+            id(${desk_id}_preset_2_raw),
+            id(${desk_id}_preset_3_raw)
+          };
+          for (int i = 0; i < 4; i++) {
+            float val = (raws[i] == 0xFFFF) ? NAN : (60.0f + raws[i] / 100.0f);
+            if (i == 0) id(${desk_id}_preset_0_height).publish_state(val);
+            else if (i == 1) id(${desk_id}_preset_1_height).publish_state(val);
+            else if (i == 2) id(${desk_id}_preset_2_height).publish_state(val);
+            else if (i == 3) id(${desk_id}_preset_3_height).publish_state(val);
+            if (raws[i] != 0xFFFF) {
+              ESP_LOGI("preset", "Restored Preset %d: %.1fcm (raw=%d)", i + 1, 60.0 + raws[i]/100.0, raws[i]);
+            }
+          }
+
+  # ── 물리 조작 정지 (이동 방향으로 살짝 앞 목표 → 자연 감속 정지) ──
+  - id: ${desk_id}_physical_stop
+    mode: restart
+    then:
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected()) return;
+
+          // 현재 높이와 속도 방향 확인
+          float current = id(${desk_id}_height_value);
+          float speed = id(${desk_id}_speed).state;
+
+          // 이동 방향 쪽으로 0.5cm 앞에 목표 설정 → 자연 감속 정지
+          // (역방향 명령은 모터에 무리가 감)
+          float target_cm;
+          if (speed > 0) {
+            target_cm = current + 0.5;  // 올라가는 중 → 살짝 위
+          } else if (speed < 0) {
+            target_cm = current - 0.5;  // 내려가는 중 → 살짝 아래
+          } else {
+            target_cm = current;        // 이미 정지
+          }
+
+          // 범위 제한
+          if (target_cm < 60.0) target_cm = 60.0;
+          if (target_cm > 125.0) target_cm = 125.0;
+
+          uint16_t raw = (uint16_t)((target_cm - 60.0) * 100.0);
+
+          if (id(${desk_id}_handle_move) != 0) {
+            uint8_t val[] = {(uint8_t)(raw & 0xFF), (uint8_t)(raw >> 8)};
+            esp_ble_gattc_write_char(
+              id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+              id(${desk_id}_handle_move), sizeof(val), val,
+              ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+            ESP_LOGD("moving", "Physical stop: move to %.1fcm (current=%.1fcm, speed=%.1f)", target_cm, current, speed);
+          }
+      - delay: 100ms
+      - lambda: |-
+          if (id(${desk_id}_ble_client)->connected() && id(${desk_id}_handle_move) != 0) {
+            uint8_t hb[] = {0x01, 0x80};
+            esp_ble_gattc_write_char(
+              id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+              id(${desk_id}_handle_move), sizeof(hb), hb,
+              ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          }
+
+# ============================================================
+# BLE Client
+# ============================================================
+ble_client:
+  - mac_address: ${mac_addr}
+    id: ${desk_id}_ble_client
+    auto_connect: false
+    on_connect:
+      then:
+        - lambda: |-
+            // handle 캐시
+            struct { const char* svc; const char* chr; uint16_t* out; const char* name; } chars[] = {
+              {"99fa0001-338a-1024-8a49-009c0215f78a", "99fa0002-338a-1024-8a49-009c0215f78a", &id(${desk_id}_handle_ctrl), "ctrl"},
+              {"99fa0010-338a-1024-8a49-009c0215f78a", "99fa0011-338a-1024-8a49-009c0215f78a", &id(${desk_id}_handle_0011), "0011"},
+              {"99fa0020-338a-1024-8a49-009c0215f78a", "99fa0021-338a-1024-8a49-009c0215f78a", &id(${desk_id}_handle_0021), "0021"},
+              {"99fa0030-338a-1024-8a49-009c0215f78a", "99fa0031-338a-1024-8a49-009c0215f78a", &id(${desk_id}_handle_move), "move"},
+            };
+            for (auto &c : chars) {
+              auto svc_uuid = esp32_ble_tracker::ESPBTUUID::from_raw(c.svc);
+              auto chr_uuid = esp32_ble_tracker::ESPBTUUID::from_raw(c.chr);
+              auto *ch = id(${desk_id}_ble_client)->get_characteristic(svc_uuid, chr_uuid);
+              if (ch) {
+                *(c.out) = ch->handle;
+                ESP_LOGD("status", "%s handle=0x%04X", c.name, ch->handle);
+              }
+            }
+
+        - script.execute: ${desk_id}_init_sequence
+
+    on_disconnect:
+      then:
+        - logger.log: "BLE Disconnected"
+        - script.stop: ${desk_id}_move_loop
+        - lambda: |-
+            id(${desk_id}_is_moving) = false;
+            id(${desk_id}_moving_to_target) = false;
+            id(${desk_id}_notify_registered) = false;
+            id(${desk_id}_stall_since) = 0;
+        - delay: 3s
+        - if:
+            condition:
+              lambda: 'return id(${desk_id}_ble_enabled);'
+            then:
+              - ble_client.connect: ${desk_id}_ble_client
+
+
+# ============================================================
+# Interval
+# ============================================================
+interval:
+  # Heartbeat (연결 유지) — 이동 중이 아닐 때만
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (!id(${desk_id}_ble_enabled) || !id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_move) == 0) return;
+          if (id(${desk_id}_moving_to_target)) return;
+          uint8_t val[] = {0x01, 0x80};
+          esp_ble_gattc_write_char(
+            id(${desk_id}_ble_client)->get_gattc_if(),
+            id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_move), sizeof(val), val,
+            ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+
+# ============================================================
+# Sensor
+# ============================================================
+sensor:
+  # 0011 멀티플렉스 데이터 (이름, 프리셋, 설정)
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${desk_id}_ble_client
+    id: ${desk_id}_notify_0011_raw
+    service_uuid: '99fa0010-338a-1024-8a49-009c0215f78a'
+    characteristic_uuid: '99fa0011-338a-1024-8a49-009c0215f78a'
+    notify: true
+    update_interval: never
+    internal: true
+    lambda: |-
+      std::string hex_str;
+      for (size_t i = 0; i < x.size(); i++) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%02X ", x[i]);
+        hex_str += buf;
+      }
+      ESP_LOGD("status", "[%d bytes]: %s", x.size(), hex_str.c_str());
+
+      if (x.size() < 2 || x[0] != 0x01) return {};
+
+      uint8_t type = x[1];
+
+      // 설정 응답 [01 04 01 mode timeout 8F] — 엄격한 조건으로 먼저 체크
+      if (type == 0x04 && x.size() == 6 && x[2] == 0x01 && x[5] == 0x8F) {
+        uint8_t mode = x[3];
+        uint8_t timeout_val = x[4];
+        bool enabled = (mode != 0);
+        id(${desk_id}_setting_enabled) = enabled;
+
+        if (enabled) {
+          id(${desk_id}_lock_mode) = mode;
+          id(${desk_id}_lock_timeout) = timeout_val;
+        }
+
+        id(${desk_id}_key_lock).publish_state(enabled);
+
+        if (mode == 0x01) id(${desk_id}_lock_mode_select).publish_state("Double tap, second press to drive");
+        else if (mode == 0x02) id(${desk_id}_lock_mode_select).publish_state("Double tap");
+        else if (mode == 0x04) id(${desk_id}_lock_mode_select).publish_state("Press connect button, double-tap the DPI, then tilt");
+
+        if (timeout_val == 0x03) id(${desk_id}_lock_timeout_select).publish_state("3s");
+        else if (timeout_val == 0x06) id(${desk_id}_lock_timeout_select).publish_state("6s");
+        else if (timeout_val == 0x0A) id(${desk_id}_lock_timeout_select).publish_state("10s");
+
+        ESP_LOGI("status", "Lock: enabled=%d mode=0x%02X timeout=0x%02X", enabled, mode, timeout_val);
+      }
+
+      // ⚠️ 프리셋을 이름보다 먼저 체크해야 함!
+      // 이름 조건 `type == (x.size()-2)` 가 프리셋 패킷도 매칭하기 때문
+      // 예: 프리셋 [01 05 slot 01 01 h_lo h_hi] (7bytes) → type=5, size-2=5 → 이름으로 오인
+
+      // 프리셋 데이터 [01 05 slot 01 01 h_lo h_hi]
+      else if (type == 0x05 && x.size() >= 7) {
+        uint8_t slot = x[2];
+        uint16_t raw_h = (x[6] << 8) | x[5];
+        float h_cm = 60.0 + (raw_h / 100.0);
+        ESP_LOGI("preset", "Preset slot=%d, raw=%d, height=%.1fcm", slot, raw_h, h_cm);
+
+        if (slot == 0) { id(${desk_id}_preset_0_raw) = raw_h; id(${desk_id}_preset_0_height).publish_state(h_cm); }
+        else if (slot == 1) { id(${desk_id}_preset_1_raw) = raw_h; id(${desk_id}_preset_1_height).publish_state(h_cm); }
+        else if (slot == 2) { id(${desk_id}_preset_2_raw) = raw_h; id(${desk_id}_preset_2_height).publish_state(h_cm); }
+        else if (slot == 3) { id(${desk_id}_preset_3_raw) = raw_h; id(${desk_id}_preset_3_height).publish_state(h_cm); }
+      }
+
+      // 프리셋 비어있음 [01 03 slot 01 00]
+      else if (type == 0x03 && x.size() >= 5 && x[4] == 0x00) {
+        uint8_t slot = x[2];
+        ESP_LOGW("preset", "Preset slot=%d EMPTY", slot);
+        if (slot == 0) { id(${desk_id}_preset_0_raw) = 0xFFFF; id(${desk_id}_preset_0_height).publish_state(NAN); }
+        else if (slot == 1) { id(${desk_id}_preset_1_raw) = 0xFFFF; id(${desk_id}_preset_1_height).publish_state(NAN); }
+        else if (slot == 2) { id(${desk_id}_preset_2_raw) = 0xFFFF; id(${desk_id}_preset_2_height).publish_state(NAN); }
+        else if (slot == 3) { id(${desk_id}_preset_3_raw) = 0xFFFF; id(${desk_id}_preset_3_height).publish_state(NAN); }
+      }
+
+      // 데스크 이름 [01 len ASCII...] — len == x.size()-2 이고 모든 바이트가 printable ASCII
+      // ※ 프리셋/빈프리셋 뒤에 체크해야 충돌하지 않음
+      else if (x.size() > 2 && type == (x.size() - 2)) {
+        bool is_ascii = true;
+        for (size_t i = 2; i < x.size(); i++) {
+          if (x[i] < 0x20 || x[i] > 0x7E) { is_ascii = false; break; }
+        }
+        if (is_ascii) {
+          std::string name(x.begin() + 2, x.end());
+          ESP_LOGI("status", "Desk Name: %s", name.c_str());
+          id(${desk_id}_name_sensor).publish_state(name);
+        }
+      }
+
+      return {};
+
+  # 높이 센서 (0021 notify)
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: ${desk_id}_ble_client
+    name: "${dpi1c_desk} Height"
+    id: ${desk_id}_height
+    service_uuid: '99fa0020-338a-1024-8a49-009c0215f78a'
+    characteristic_uuid: '99fa0021-338a-1024-8a49-009c0215f78a'
+    notify: true
+    update_interval: never
+    unit_of_measurement: 'cm'
+    accuracy_decimals: 1
+    icon: 'mdi:human-male-height'
+    lambda: |-
+      if (x.size() >= 4) {
+        uint16_t raw_height = (x[1] << 8) | x[0];
+        int16_t raw_speed = (x[3] << 8) | x[2];
+        float height_cm = 60.0 + (raw_height / 100.0);
+        float speed_mms = raw_speed / 100.0;
+        id(${desk_id}_height_value) = height_cm;
+        id(${desk_id}_speed).publish_state(speed_mms);
+
+        // 물리버튼 조작 감지: 이동 중 반대 방향 움직임
+        if (id(${desk_id}_moving_to_target) && std::abs(raw_speed) > 0) {
+          float target_cm = 60.0 + (id(${desk_id}_target_raw) / 100.0);
+          bool target_up = (target_cm > height_cm);
+          bool moving_up = (raw_speed > 0);
+          if (target_up != moving_up) {
+            id(${desk_id}_moving_to_target) = false;
+            id(${desk_id}_is_moving) = false;
+            ESP_LOGW("moving", "Physical control detected -> Aborting move (Target=%.1f Current=%.1f Dir=%s)",
+                     target_cm, height_cm, moving_up ? "up" : "down");
+          }
+        }
+
+        if (std::abs(raw_speed) > 0) {
+          id(${desk_id}_is_moving) = true;
+          id(${desk_id}_motor_direction).publish_state(raw_speed > 0 ? "up" : "down");
+        } else {
+          id(${desk_id}_is_moving) = false;
+          id(${desk_id}_motor_direction).publish_state("stopped");
+          id(${desk_id}_target_height).publish_state(roundf(height_cm * 10) / 10.0);
+        }
+        return height_cm;
+      }
+      return {};
+
+  # 속도 센서
+  - platform: template
+    name: "${dpi1c_desk} Speed"
+    id: ${desk_id}_speed
+    unit_of_measurement: 'mm/s'
+    accuracy_decimals: 1
+    icon: 'mdi:speedometer'
+
+  # 프리셋 높이 표시 센서
+  - platform: template
+    name: "${dpi1c_desk} Preset 1 Height"
+    id: ${desk_id}_preset_0_height
+    unit_of_measurement: 'cm'
+    accuracy_decimals: 1
+    icon: 'mdi:numeric-1-box'
+
+  - platform: template
+    name: "${dpi1c_desk} Preset 2 Height"
+    id: ${desk_id}_preset_1_height
+    unit_of_measurement: 'cm'
+    accuracy_decimals: 1
+    icon: 'mdi:numeric-2-box'
+
+  - platform: template
+    name: "${dpi1c_desk} Preset 3 Height"
+    id: ${desk_id}_preset_2_height
+    unit_of_measurement: 'cm'
+    accuracy_decimals: 1
+    icon: 'mdi:numeric-3-box'
+
+  - platform: template
+    name: "${dpi1c_desk} Preset 4 Height"
+    id: ${desk_id}_preset_3_height
+    unit_of_measurement: 'cm'
+    accuracy_decimals: 1
+    icon: 'mdi:numeric-4-box'
+
+# ============================================================
+# Text Sensor
+# ============================================================
+text_sensor:
+  - platform: template
+    name: "${dpi1c_desk} Name"
+    id: ${desk_id}_name_sensor
+    update_interval: never
+    icon: 'mdi:tag-text'
+
+  - platform: template
+    name: "${dpi1c_desk} Motor Direction"
+    id: ${desk_id}_motor_direction
+    update_interval: never
+
+# ============================================================
+# Binary Sensor
+# ============================================================
+binary_sensor:
+  - platform: template
+    name: "${dpi1c_desk} Moving"
+    id: ${desk_id}_moving
+    lambda: 'return id(${desk_id}_is_moving);'
+
+# ============================================================
+# Buttons
+# ============================================================
+button:
+  # 수동 Up (max raw=6500 → 125cm)
+  - platform: template
+    name: "${dpi1c_desk} Move Up"
+    id: btn_${desk_id}_up
+    icon: 'mdi:arrow-up-bold'
+    on_press:
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_move) == 0) {
+            ESP_LOGW("status", "Not connected"); return;
+          }
+          uint16_t raw = 6500;
+          id(${desk_id}_target_raw) = raw;
+          id(${desk_id}_moving_to_target) = true;
+          id(${desk_id}_is_moving) = true;
+          id(${desk_id}_move_after) = millis();
+          uint8_t val[] = {(uint8_t)(raw & 0xFF), (uint8_t)(raw >> 8)};
+          esp_ble_gattc_write_char(
+            id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_move), sizeof(val), val,
+            ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGD("moving", "Up (raw=%d)", raw);
+      - script.execute: ${desk_id}_move_loop
+
+  # 수동 Down (min raw=0 → 60cm)
+  - platform: template
+    name: "${dpi1c_desk} Move Down"
+    id: btn_${desk_id}_down
+    icon: 'mdi:arrow-down-bold'
+    on_press:
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_move) == 0) {
+            ESP_LOGW("status", "Not connected"); return;
+          }
+          uint16_t raw = 0;
+          id(${desk_id}_target_raw) = raw;
+          id(${desk_id}_moving_to_target) = true;
+          id(${desk_id}_is_moving) = true;
+          id(${desk_id}_move_after) = millis();
+          uint8_t val[] = {0x00, 0x00};
+          esp_ble_gattc_write_char(
+            id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_move), sizeof(val), val,
+            ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGD("moving", "Down (raw=%d)", raw);
+      - script.execute: ${desk_id}_move_loop
+
+  # 정지
+  - platform: template
+    name: "${dpi1c_desk} Move Stop"
+    id: btn_${desk_id}_stop
+    icon: 'mdi:stop'
+    on_press:
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected()) {
+            ESP_LOGW("moving", "Stop: BLE not connected");
+            return;
+          }
+
+          // BLE 이동 중인지 먼저 확인 (아래에서 false로 바꾸기 전에)
+          bool was_ble_move = id(${desk_id}_moving_to_target);
+
+          id(${desk_id}_moving_to_target) = false;
+          id(${desk_id}_is_moving) = false;
+
+          // 공통: FF 00 → ctrl
+          if (id(${desk_id}_handle_ctrl) != 0) {
+            uint8_t stop[] = {0xFF, 0x00};
+            esp_ble_gattc_write_char(
+              id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+              id(${desk_id}_handle_ctrl), sizeof(stop), stop,
+              ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          }
+
+          if (was_ble_move) {
+            // ── BLE 이동 정지: FF 00만 → 원래 동작 ──
+            ESP_LOGD("moving", "Stop (BLE): FF 00 → ctrl");
+          } else {
+            // ── 물리 조작 정지: script로 반복 정지 (move-to-current) ──
+            ESP_LOGD("moving", "Stop (Physical): starting physical_stop script");
+            id(${desk_id}_physical_stop).execute();
+          }
+      - delay: 100ms
+      - lambda: |-
+          // Heartbeat (BLE 정지 시 마무리, physical_stop에도 포함되어 있어 중복 무해)
+          if (id(${desk_id}_ble_client)->connected() && id(${desk_id}_handle_move) != 0) {
+            uint8_t hb[] = {0x01, 0x80};
+            esp_ble_gattc_write_char(
+              id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+              id(${desk_id}_handle_move), sizeof(hb), hb,
+              ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          }
+
+  # 프리셋 이동 버튼 (1~4)
+  - platform: template
+    name: "${dpi1c_desk} Preset 1"
+    id: btn_${desk_id}_preset_1
+    icon: 'mdi:numeric-1-box'
+    on_press:
+      - script.execute:
+          id: ${desk_id}_preset_move
+          slot: 0
+
+  - platform: template
+    name: "${dpi1c_desk} Preset 2"
+    id: btn_${desk_id}_preset_2
+    icon: 'mdi:numeric-2-box'
+    on_press:
+      - script.execute:
+          id: ${desk_id}_preset_move
+          slot: 1
+
+  - platform: template
+    name: "${dpi1c_desk} Preset 3"
+    id: btn_${desk_id}_preset_3
+    icon: 'mdi:numeric-3-box'
+    on_press:
+      - script.execute:
+          id: ${desk_id}_preset_move
+          slot: 2
+
+  - platform: template
+    name: "${dpi1c_desk} Preset 4"
+    id: btn_${desk_id}_preset_4
+    icon: 'mdi:numeric-4-box'
+    on_press:
+      - script.execute:
+          id: ${desk_id}_preset_move
+          slot: 3
+
+  # 프리셋 저장 (1~4)
+  - platform: template
+    name: "${dpi1c_desk} Preset Save 1"
+    id: btn_${desk_id}_save_preset_1
+    icon: 'mdi:content-save'
+    on_press:
+      - script.execute:
+          id: ${desk_id}_preset_save
+          slot: 0
+
+  - platform: template
+    name: "${dpi1c_desk} Preset Save 2"
+    id: btn_${desk_id}_save_preset_2
+    icon: 'mdi:content-save'
+    on_press:
+      - script.execute:
+          id: ${desk_id}_preset_save
+          slot: 1
+
+  - platform: template
+    name: "${dpi1c_desk} Preset Save 3"
+    id: btn_${desk_id}_save_preset_3
+    icon: 'mdi:content-save'
+    on_press:
+      - script.execute:
+          id: ${desk_id}_preset_save
+          slot: 2
+
+  - platform: template
+    name: "${dpi1c_desk} Preset Save 4"
+    id: btn_${desk_id}_save_preset_4
+    icon: 'mdi:content-save'
+    on_press:
+      - script.execute:
+          id: ${desk_id}_preset_save
+          slot: 3
+
+  # 프리셋 삭제 (1~4)
+  - platform: template
+    name: "${dpi1c_desk} Preset Delete 1"
+    id: btn_${desk_id}_del_preset_1
+    icon: 'mdi:delete'
+    on_press:
+      - script.execute:
+          id: ${desk_id}_preset_delete
+          slot: 0
+
+  - platform: template
+    name: "${dpi1c_desk} Preset Delete 2"
+    id: btn_${desk_id}_del_preset_2
+    icon: 'mdi:delete'
+    on_press:
+      - script.execute:
+          id: ${desk_id}_preset_delete
+          slot: 1
+
+  - platform: template
+    name: "${dpi1c_desk} Preset Delete 3"
+    id: btn_${desk_id}_del_preset_3
+    icon: 'mdi:delete'
+    on_press:
+      - script.execute:
+          id: ${desk_id}_preset_delete
+          slot: 2
+
+  - platform: template
+    name: "${dpi1c_desk} Preset Delete 4"
+    id: btn_${desk_id}_del_preset_4
+    icon: 'mdi:delete'
+    on_press:
+      - script.execute:
+          id: ${desk_id}_preset_delete
+          slot: 3
+
+# ============================================================
+# Number Slider (목표 높이)
+# ============================================================
+number:
+  - platform: template
+    name: "${dpi1c_desk} Target Height"
+    id: ${desk_id}_target_height
+    min_value: 60.0
+    max_value: 125.0
+    step: 0.1
+    unit_of_measurement: 'cm'
+    icon: 'mdi:human-male-height'
+    optimistic: true
+    restore_value: true
+    set_action:
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_move) == 0) {
+            ESP_LOGW("status", "Not connected");
+            return;
+          }
+          float target = x;
+          uint16_t raw = (uint16_t)((target - 60.0) * 100.0);
+
+          if (id(${desk_id}_moving_to_target)) {
+            id(${desk_id}_moving_to_target) = false;
+            uint8_t stop[] = {0xFF, 0x00};
+            esp_ble_gattc_write_char(
+              id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+              id(${desk_id}_handle_ctrl), sizeof(stop), stop,
+              ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+            uint8_t hb[] = {0x01, 0x80};
+            esp_ble_gattc_write_char(
+              id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+              id(${desk_id}_handle_move), sizeof(hb), hb,
+              ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+            id(${desk_id}_move_after) = millis() + 2000;
+            ESP_LOGW("status", "Slider re-operation detected -> stopping, restarting in 2 sec");
+          } else {
+            id(${desk_id}_move_after) = millis();
+          }
+
+          id(${desk_id}_target_raw) = raw;
+          id(${desk_id}_moving_to_target) = true;
+          id(${desk_id}_is_moving) = true;
+          ESP_LOGI("moving", "Target: %.1fcm (raw=%d)", target, raw);
+      - script.execute: ${desk_id}_move_loop
+
+# ============================================================
+# Switch
+# ============================================================
+switch:
+  - platform: template
+    name: "${dpi1c_desk} BLE Connection"
+    id: ${desk_id}_ble_switch
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - lambda: |-
+          id(${desk_id}_ble_enabled) = true;
+          ESP_LOGI("status", "Attempting BLE connection");
+      - ble_client.connect: ${desk_id}_ble_client
+    turn_off_action:
+      - lambda: |-
+          id(${desk_id}_ble_enabled) = false;
+          id(${desk_id}_is_moving) = false;
+          id(${desk_id}_moving_to_target) = false;
+          ESP_LOGI("status", "BLE Disconnected");
+      - ble_client.disconnect: ${desk_id}_ble_client
+
+  # 키잠금 (Child Lock)
+  - platform: template
+    name: "${dpi1c_desk} Key Lock"
+    id: ${desk_id}_key_lock
+    icon: 'mdi:lock'
+    optimistic: true
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) {
+            ESP_LOGW("status", "Key Lock verification failed");
+            id(${desk_id}_key_lock).publish_state(false);
+            return;
+          }
+          uint8_t mode = id(${desk_id}_lock_mode);
+          uint8_t tout = id(${desk_id}_lock_timeout);
+          if (mode == 0) mode = 0x01;
+          if (tout == 0) tout = 0x0A;
+          id(${desk_id}_lock_mode) = mode;
+          id(${desk_id}_lock_timeout) = tout;
+          uint8_t cmd[] = {0x7F, 0x3F, 0x80, 0x00, mode, tout};
+          esp_ble_gattc_write_char(
+            id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd,
+            ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGI("status", "Key Lock ON: mode=0x%02X tout=0x%02X", mode, tout);
+      - script.execute: ${desk_id}_read_lock_setting
+    turn_off_action:
+      - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) {
+            ESP_LOGW("status", "Key Lock verification failed");
+            id(${desk_id}_key_lock).publish_state(true);
+            return;
+          }
+          uint8_t cmd[] = {0x7F, 0x3F, 0x80, 0x00, 0x00, 0x00};
+          esp_ble_gattc_write_char(
+            id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd,
+            ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          ESP_LOGI("status", "Key Lock OFF");
+      - script.execute: ${desk_id}_read_lock_setting
+
+# ============================================================
+# Select
+# ============================================================
+select:
+  - platform: template
+    name: "${dpi1c_desk} Lock Mode"
+    id: ${desk_id}_lock_mode_select
+    icon: 'mdi:gesture-double-tap'
+    optimistic: true
+    restore_value: false
+    options:
+      - "Double tap"
+      - "Double tap, second press to drive"
+      - "Press connect button, double-tap the DPI, then tilt"
+    set_action:
+      - lambda: |-
+          uint8_t mode = 0x01;
+          if (x == "Double tap, second press to drive") mode = 0x01;
+          else if (x == "Double tap") mode = 0x02;
+          else if (x == "Press connect button, double-tap the DPI, then tilt") mode = 0x04;
+          id(${desk_id}_lock_mode) = mode;
+          ESP_LOGI("status", "Key Lock mode → 0x%02X", mode);
+          if (!id(${desk_id}_setting_enabled)) return;
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) return;
+          uint8_t tout = id(${desk_id}_lock_timeout);
+          uint8_t cmd[] = {0x7F, 0x3F, 0x80, 0x00, mode, tout};
+          esp_ble_gattc_write_char(
+            id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd,
+            ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+
+  - platform: template
+    name: "${dpi1c_desk} Lock Timeout"
+    id: ${desk_id}_lock_timeout_select
+    icon: 'mdi:timer-outline'
+    optimistic: true
+    restore_value: false
+    options:
+      - "3s"
+      - "6s"
+      - "10s"
+    initial_option: "10s"
+    set_action:
+      - lambda: |-
+          uint8_t tout = 0x0A;
+          if (x == "3s") tout = 0x03;
+          else if (x == "6s") tout = 0x06;
+          else if (x == "10s") tout = 0x0A;
+          id(${desk_id}_lock_timeout) = tout;
+          ESP_LOGI("status", "Key Lock timeout → 0x%02X", tout);
+          if (!id(${desk_id}_setting_enabled)) return;
+          if (!id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_0011) == 0) return;
+          uint8_t mode = id(${desk_id}_lock_mode);
+          uint8_t cmd[] = {0x7F, 0x3F, 0x80, 0x00, mode, tout};
+          esp_ble_gattc_write_char(
+            id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
+            id(${desk_id}_handle_0011), sizeof(cmd), cmd,
+            ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
