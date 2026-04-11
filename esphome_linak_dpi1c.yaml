@@ -93,6 +93,11 @@ globals:
     type: bool
     initial_value: 'false'
 
+  # Watchdog: 마지막 notify 수신 시각 (millis)
+  - id: ${desk_id}_last_notify_ms
+    type: uint32_t
+    initial_value: '0'
+
   # GATT handles
   - id: ${desk_id}_handle_ctrl
     type: uint16_t
@@ -496,18 +501,34 @@ ble_client:
 # Interval
 # ============================================================
 interval:
-  # Heartbeat (연결 유지) — 이동 중이 아닐 때만
-  - interval: 60s
+  # Heartbeat (연결 유지) — 30초 간격 + write 실패 감지
+  - interval: 30s
     then:
       - lambda: |-
           if (!id(${desk_id}_ble_enabled) || !id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_move) == 0) return;
           if (id(${desk_id}_moving_to_target)) return;
           uint8_t val[] = {0x01, 0x80};
-          esp_ble_gattc_write_char(
+          auto err = esp_ble_gattc_write_char(
             id(${desk_id}_ble_client)->get_gattc_if(),
             id(${desk_id}_ble_client)->get_conn_id(),
             id(${desk_id}_handle_move), sizeof(val), val,
             ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+          if (err != ESP_OK) {
+            ESP_LOGW("watchdog", "Heartbeat write failed (err=%d), forcing disconnect", err);
+            id(${desk_id}_ble_client)->disconnect();
+          }
+
+  # Watchdog — 5분마다 notify 수신 여부 확인, 무응답 시 강제 재연결
+  - interval: 5min
+    then:
+      - lambda: |-
+          if (!id(${desk_id}_ble_enabled) || !id(${desk_id}_ble_client)->connected()) return;
+          uint32_t now = millis();
+          uint32_t last = id(${desk_id}_last_notify_ms);
+          if (last > 0 && (now - last) > 300000) {
+            ESP_LOGW("watchdog", "No BLE notify for %us, forcing reconnect", (now - last) / 1000);
+            id(${desk_id}_ble_client)->disconnect();
+          }
 
 # ============================================================
 # Sensor
@@ -619,6 +640,7 @@ sensor:
     icon: 'mdi:human-male-height'
     lambda: |-
       if (x.size() >= 4) {
+        id(${desk_id}_last_notify_ms) = millis();
         uint16_t raw_height = (x[1] << 8) | x[0];
         int16_t raw_speed = (x[3] << 8) | x[2];
         float height_cm = 60.0 + (raw_height / 100.0);
@@ -658,6 +680,20 @@ sensor:
     unit_of_measurement: 'mm/s'
     accuracy_decimals: 1
     icon: 'mdi:speedometer'
+
+  # Watchdog 진단: 마지막 BLE notify 이후 경과 시간
+  - platform: template
+    name: "${dpi1c_desk} BLE Last Notify"
+    id: ${desk_id}_ble_last_notify
+    unit_of_measurement: 's'
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    icon: 'mdi:heart-pulse'
+    lambda: |-
+      uint32_t last = id(${desk_id}_last_notify_ms);
+      if (last == 0) return NAN;
+      return (float)(millis() - last) / 1000.0f;
+    update_interval: 30s
 
   # 프리셋 높이 표시 센서
   - platform: template
