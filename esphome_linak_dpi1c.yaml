@@ -472,8 +472,8 @@ ble_client:
               }
             }
             // 연결 시 watchdog 기준점 설정 — notify가 안 오면 3분 후 감지
+            // stage는 여기서 리셋하지 않음 — notify 수신 시에만 리셋
             id(${desk_id}_last_notify_ms) = millis();
-            id(${desk_id}_watchdog_stage) = 0;
 
         - script.execute: ${desk_id}_init_sequence
 
@@ -498,6 +498,14 @@ ble_client:
 # Interval
 # ============================================================
 interval:
+  # 재연결 retry — 미연결 상태에서 30초마다 연결 재시도
+  - interval: 30s
+    then:
+      - lambda: |-
+          if (!id(${desk_id}_ble_enabled) || id(${desk_id}_ble_client)->connected()) return;
+          ESP_LOGI("watchdog", "BLE not connected, retrying connection...");
+      - ble_client.connect: ${desk_id}_ble_client
+
   # Heartbeat (연결 유지) — 30초 간격 + write 실패 감지
   - interval: 30s
     then:
