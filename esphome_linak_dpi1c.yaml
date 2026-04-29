@@ -100,6 +100,11 @@ globals:
     type: uint32_t
     initial_value: '0'
 
+  # Watchdog: 복구 시도 단계 (0=정상, 1=disconnect시도, 2=GAP disconnect시도)
+  - id: ${desk_id}_watchdog_stage
+    type: uint8_t
+    initial_value: '0'
+
   # GATT handles
   - id: ${desk_id}_handle_ctrl
     type: uint16_t
@@ -468,6 +473,7 @@ ble_client:
             }
             // 연결 시 watchdog 기준점 설정 — notify가 안 오면 3분 후 감지
             id(${desk_id}_last_notify_ms) = millis();
+            id(${desk_id}_watchdog_stage) = 0;
 
         - script.execute: ${desk_id}_init_sequence
 
@@ -509,27 +515,41 @@ interval:
             id(${desk_id}_ble_client)->disconnect();
           }
 
-  # Watchdog — 2분마다 notify 수신 여부 확인 (단계적 에스컬레이션)
-  # on_connect에서 last_notify_ms = millis()로 초기화되므로 last > 0 조건 불필요
+  # Watchdog — 2분마다 notify 수신 여부 확인 (3단계 에스컬레이션)
+  # Stage 0: 정상 → 3분 무응답 시 ESPHome disconnect
+  # Stage 1: disconnect 시도 후 → 추가 3분 무응답 시 GAP 레벨 disconnect
+  # Stage 2: GAP disconnect 시도 후 → 추가 3분 무응답 시 esp_restart
   - interval: 2min
     then:
       - lambda: |-
           if (!id(${desk_id}_ble_enabled) || !id(${desk_id}_ble_client)->connected()) return;
           uint32_t now = millis();
           uint32_t last = id(${desk_id}_last_notify_ms);
-          if (last == 0) return;  // 아직 한번도 연결 안 됨 (부팅 직후)
+          if (last == 0) return;
           uint32_t elapsed = now - last;
+          uint8_t stage = id(${desk_id}_watchdog_stage);
 
-          ESP_LOGD("watchdog", "Notify age: %us, heap: %u", elapsed / 1000, esp_get_free_heap_size());
+          ESP_LOGD("watchdog", "Notify age: %us, stage: %u, heap: %u", elapsed / 1000, stage, esp_get_free_heap_size());
 
-          // 3분 무응답: disconnect 시도
-          if (elapsed > 180000 && elapsed <= 600000) {
-            ESP_LOGW("watchdog", "No notify for %us, forcing disconnect", elapsed / 1000);
+          if (elapsed <= 180000) return;  // 3분 이내면 정상
+
+          if (stage == 0) {
+            // Stage 1: ESPHome 레벨 disconnect
+            ESP_LOGW("watchdog", "No notify for %us — Stage 1: ESPHome disconnect", elapsed / 1000);
+            id(${desk_id}_watchdog_stage) = 1;
+            id(${desk_id}_last_notify_ms) = now;  // 타이머 리셋
             id(${desk_id}_ble_client)->disconnect();
           }
-          // 10분 무응답: disconnect가 안 먹힌 좀비 연결 → ESP32 재부팅
-          else if (elapsed > 600000) {
-            ESP_LOGE("watchdog", "Zombie connection detected (%us no notify), rebooting ESP32", elapsed / 1000);
+          else if (stage == 1) {
+            // Stage 2: GAP 레벨 직접 disconnect (하위 레이어)
+            ESP_LOGW("watchdog", "Stage 1 failed — Stage 2: GAP disconnect");
+            id(${desk_id}_watchdog_stage) = 2;
+            id(${desk_id}_last_notify_ms) = now;
+            esp_ble_gap_disconnect(id(${desk_id}_ble_client)->get_remote_bda());
+          }
+          else if (stage == 2) {
+            // Stage 3: 최후 수단 — ESP32 재부팅
+            ESP_LOGE("watchdog", "Stage 2 failed — rebooting ESP32");
             delay(100);
             esp_restart();
           }
@@ -656,6 +676,7 @@ sensor:
     lambda: |-
       if (x.size() >= 4) {
         id(${desk_id}_last_notify_ms) = millis();
+        id(${desk_id}_watchdog_stage) = 0;
         uint16_t raw_height = (x[1] << 8) | x[0];
         int16_t raw_speed = (x[3] << 8) | x[2];
         float height_cm = 60.0 + (raw_height / 100.0);
