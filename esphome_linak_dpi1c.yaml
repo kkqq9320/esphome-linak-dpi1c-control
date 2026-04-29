@@ -466,6 +466,8 @@ ble_client:
                 ESP_LOGD("status", "%s handle=0x%04X", c.name, ch->handle);
               }
             }
+            // 연결 시 watchdog 기준점 설정 — notify가 안 오면 3분 후 감지
+            id(${desk_id}_last_notify_ms) = millis();
 
         - script.execute: ${desk_id}_init_sequence
 
@@ -478,7 +480,6 @@ ble_client:
             id(${desk_id}_moving_to_target) = false;
             id(${desk_id}_notify_registered) = false;
             id(${desk_id}_stall_since) = 0;
-            id(${desk_id}_last_notify_ms) = 0;
         - delay: 3s
         - if:
             condition:
@@ -509,21 +510,25 @@ interval:
           }
 
   # Watchdog — 2분마다 notify 수신 여부 확인 (단계적 에스컬레이션)
+  # on_connect에서 last_notify_ms = millis()로 초기화되므로 last > 0 조건 불필요
   - interval: 2min
     then:
       - lambda: |-
           if (!id(${desk_id}_ble_enabled) || !id(${desk_id}_ble_client)->connected()) return;
           uint32_t now = millis();
           uint32_t last = id(${desk_id}_last_notify_ms);
-          uint32_t elapsed = (last > 0) ? (now - last) : 0;
+          if (last == 0) return;  // 아직 한번도 연결 안 됨 (부팅 직후)
+          uint32_t elapsed = now - last;
+
+          ESP_LOGD("watchdog", "Notify age: %us, heap: %u", elapsed / 1000, esp_get_free_heap_size());
 
           // 3분 무응답: disconnect 시도
-          if (last > 0 && elapsed > 180000 && elapsed <= 600000) {
+          if (elapsed > 180000 && elapsed <= 600000) {
             ESP_LOGW("watchdog", "No notify for %us, forcing disconnect", elapsed / 1000);
             id(${desk_id}_ble_client)->disconnect();
           }
           // 10분 무응답: disconnect가 안 먹힌 좀비 연결 → ESP32 재부팅
-          else if (last > 0 && elapsed > 600000) {
+          else if (elapsed > 600000) {
             ESP_LOGE("watchdog", "Zombie connection detected (%us no notify), rebooting ESP32", elapsed / 1000);
             delay(100);
             esp_restart();
