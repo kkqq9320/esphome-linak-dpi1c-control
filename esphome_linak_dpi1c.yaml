@@ -501,10 +501,15 @@ interval:
   # 재연결 retry — 미연결 상태에서 30초마다 연결 재시도
   - interval: 30s
     then:
-      - lambda: |-
-          if (!id(${desk_id}_ble_enabled) || id(${desk_id}_ble_client)->connected()) return;
-          ESP_LOGI("watchdog", "BLE not connected, retrying connection...");
-      - ble_client.connect: ${desk_id}_ble_client
+      - if:
+          condition:
+            lambda: 'return id(${desk_id}_ble_enabled) && !id(${desk_id}_ble_client)->connected();'
+          then:
+            - logger.log:
+                level: INFO
+                tag: watchdog
+                format: "BLE not connected, retrying connection..."
+            - ble_client.connect: ${desk_id}_ble_client
 
   # Heartbeat (연결 유지) — 30초 간격 + write 실패 감지
   - interval: 30s
