@@ -99,6 +99,27 @@ packages:
 
 ```
 
+### Testing the feature branch
+
+When testing `feature/ble-watchdog`, pin the package to that branch and force a refresh so ESPHome does not compile the cached `main` package:
+
+```yaml
+packages:
+  esphome_linak_dpi1c:
+    url: https://github.com/kkqq9320/esphome-linak-dpi1c-control/
+    ref: feature/ble-watchdog
+    refresh: 0s
+    files:
+      - path: esphome_linak_dpi1c.yaml
+        vars:
+          dpi1c_desk: "Desker"
+          desk_id: "desker_id1"
+          mac_addr: "CA:07:XX:XX:XX:XX"
+          log_level: "INFO"
+```
+
+After compiling, the generated configuration should include diagnostic entities such as `API Connected`, `API Disconnected For`, `API Disconnect Count`, `BLE Connected`, `WiFi Signal`, `Uptime`, `Reset Reason`, and `API Watchdog`.
+
 ## How to Connect & Setup
 
 Follow these exact steps to pair the ESP32 board to your desk for the first time:
