@@ -595,12 +595,29 @@ interval:
           if (err != ESP_OK) {
             ESP_LOGW("watchdog", "Heartbeat write failed (err=%d), forcing disconnect", err);
             id(${desk_id}_ble_client)->disconnect();
+            return;
           }
 
-  # Watchdog — 2분마다 notify 수신 여부 확인 (3단계 에스컬레이션)
-  # Stage 0: 정상 → 3분 무응답 시 ESPHome disconnect
-  # Stage 1: disconnect 시도 후 → 추가 3분 무응답 시 GAP 레벨 disconnect
-  # Stage 2: GAP disconnect 시도 후 → 추가 3분 무응답 시 esp_restart
+          // LINAK may stop height notifications while idle. Probe with a light read
+          // instead of treating quiet idle periods as a broken connection.
+          uint32_t last = id(${desk_id}_last_notify_ms);
+          if (last != 0 && id(${desk_id}_handle_0021) != 0 && millis() - last > 120000) {
+            auto read_err = esp_ble_gattc_read_char(
+              id(${desk_id}_ble_client)->get_gattc_if(),
+              id(${desk_id}_ble_client)->get_conn_id(),
+              id(${desk_id}_handle_0021),
+              ESP_GATT_AUTH_REQ_NO_MITM);
+            if (read_err != ESP_OK) {
+              ESP_LOGW("watchdog", "Idle height read failed (err=%d), forcing disconnect", read_err);
+              id(${desk_id}_ble_client)->disconnect();
+            } else {
+              ESP_LOGD("watchdog", "Idle height read probe requested");
+            }
+          }
+
+  # Watchdog — 2분마다 높이 업데이트 수신 여부 확인 (3단계 에스컬레이션)
+  # Idle 상태에서는 LINAK이 notify를 멈출 수 있으므로 15분까지 허용
+  # 이동 중에는 30초 이상 높이 업데이트가 없으면 빠르게 복구 시도
   - interval: 2min
     then:
       - lambda: |-
@@ -613,11 +630,14 @@ interval:
 
           ESP_LOGD("watchdog", "Notify age: %us, stage: %u, heap: %u", elapsed / 1000, stage, esp_get_free_heap_size());
 
-          if (elapsed <= 180000) return;  // 3분 이내면 정상
+          bool moving = id(${desk_id}_moving_to_target) || id(${desk_id}_is_moving);
+          uint32_t stale_limit = moving ? 30000 : 900000;
+          if (elapsed <= stale_limit) return;
 
           if (stage == 0) {
             // Stage 1: ESPHome 레벨 disconnect
-            ESP_LOGW("watchdog", "No notify for %us — Stage 1: ESPHome disconnect", elapsed / 1000);
+            ESP_LOGW("watchdog", "No height update for %us (%s) — Stage 1: ESPHome disconnect",
+                     elapsed / 1000, moving ? "moving" : "idle");
             id(${desk_id}_watchdog_stage) = 1;
             id(${desk_id}_last_notify_ms) = now;  // 타이머 리셋
             id(${desk_id}_ble_client)->disconnect();
