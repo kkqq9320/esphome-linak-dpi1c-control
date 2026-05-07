@@ -40,6 +40,25 @@ esphome:
             lambda: 'return id(${desk_id}_ble_enabled);'
           then:
             - ble_client.connect: ${desk_id}_ble_client
+
+# ============================================================
+# Native API diagnostics
+# ============================================================
+# 사용자 메인 YAML의 api.encryption 설정과 병합되어 동작합니다.
+api:
+  on_client_connected:
+    - lambda: |-
+        id(${desk_id}_api_last_connected_ms) = millis();
+        id(${desk_id}_api_disconnected_since) = 0;
+        id(${desk_id}_api_connected) = true;
+        ESP_LOGI("api_watchdog", "API client connected: %s (%s)", client_info.c_str(), client_address.c_str());
+
+  on_client_disconnected:
+    - lambda: |-
+        id(${desk_id}_api_last_disconnected_ms) = millis();
+        id(${desk_id}_api_disconnect_count)++;
+        ESP_LOGW("api_watchdog", "API client disconnected: %s (%s), count=%u",
+                 client_info.c_str(), client_address.c_str(), id(${desk_id}_api_disconnect_count));
 # ============================================================
 # LINAK DPI1C Desk BLE Control for ESPHome (v2 — HCI 로그 기반)
 # Controller: DPI1C000011006 / MAC: 
@@ -104,6 +123,26 @@ globals:
   - id: ${desk_id}_watchdog_stage
     type: uint8_t
     initial_value: '0'
+
+  # Native API diagnostics: HA/ESPHome API 연결 상태 추적
+  - id: ${desk_id}_api_connected
+    type: bool
+    initial_value: 'false'
+  - id: ${desk_id}_api_disconnected_since
+    type: uint32_t
+    initial_value: '0'
+  - id: ${desk_id}_api_last_connected_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: ${desk_id}_api_last_disconnected_ms
+    type: uint32_t
+    initial_value: '0'
+  - id: ${desk_id}_api_disconnect_count
+    type: uint32_t
+    initial_value: '0'
+  - id: ${desk_id}_api_watchdog_enabled
+    type: bool
+    initial_value: 'false'
 
   # GATT handles
   - id: ${desk_id}_handle_ctrl
@@ -498,6 +537,35 @@ ble_client:
 # Interval
 # ============================================================
 interval:
+  # Native API 상태 추적 — HA에서 끊겼는지, BLE만 끊겼는지 분리해서 보기 위함
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            api.connected:
+          then:
+            - lambda: |-
+                if (!id(${desk_id}_api_connected)) {
+                  ESP_LOGI("api_watchdog", "API connection recovered");
+                }
+                id(${desk_id}_api_connected) = true;
+                id(${desk_id}_api_disconnected_since) = 0;
+          else:
+            - lambda: |-
+                uint32_t now = millis();
+                if (id(${desk_id}_api_disconnected_since) == 0) {
+                  id(${desk_id}_api_disconnected_since) = now;
+                  ESP_LOGW("api_watchdog", "No API client connected");
+                }
+                id(${desk_id}_api_connected) = false;
+
+                uint32_t elapsed = now - id(${desk_id}_api_disconnected_since);
+                if (id(${desk_id}_api_watchdog_enabled) && elapsed > 600000) {
+                  ESP_LOGE("api_watchdog", "API disconnected for %us, rebooting ESP32", elapsed / 1000);
+                  delay(100);
+                  esp_restart();
+                }
+
   # 재연결 retry — 미연결 상태에서 30초마다 연결 재시도
   - interval: 30s
     then:
@@ -740,6 +808,43 @@ sensor:
     accuracy_decimals: 1
     icon: 'mdi:speedometer'
 
+  # ESP/HA 진단: HA API, Wi-Fi, 업타임을 같이 보면 끊김 계층을 분리할 수 있음
+  - platform: template
+    name: "${dpi1c_desk} API Disconnected For"
+    id: ${desk_id}_api_disconnected_for
+    unit_of_measurement: 's'
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    icon: 'mdi:lan-disconnect'
+    lambda: |-
+      if (id(${desk_id}_api_connected)) return 0.0f;
+      uint32_t since = id(${desk_id}_api_disconnected_since);
+      if (since == 0) return NAN;
+      return (float)(millis() - since) / 1000.0f;
+    update_interval: 30s
+
+  - platform: template
+    name: "${dpi1c_desk} API Disconnect Count"
+    id: ${desk_id}_api_disconnect_count_sensor
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    icon: 'mdi:counter'
+    lambda: |-
+      return (float)id(${desk_id}_api_disconnect_count);
+    update_interval: 60s
+
+  - platform: wifi_signal
+    name: "${dpi1c_desk} WiFi Signal"
+    id: ${desk_id}_wifi_signal
+    entity_category: diagnostic
+    update_interval: 60s
+
+  - platform: uptime
+    name: "${dpi1c_desk} Uptime"
+    id: ${desk_id}_uptime
+    entity_category: diagnostic
+    update_interval: 60s
+
   # Watchdog 진단: 마지막 BLE notify 이후 경과 시간
   - platform: template
     name: "${dpi1c_desk} BLE Last Notify"
@@ -810,6 +915,46 @@ text_sensor:
     id: ${desk_id}_motor_direction
     update_interval: never
 
+  - platform: template
+    name: "${dpi1c_desk} Reset Reason"
+    id: ${desk_id}_reset_reason
+    entity_category: diagnostic
+    icon: 'mdi:restart-alert'
+    lambda: |-
+      switch (esp_reset_reason()) {
+        case ESP_RST_POWERON: return {"POWERON"};
+        case ESP_RST_EXT: return {"EXTERNAL"};
+        case ESP_RST_SW: return {"SOFTWARE"};
+        case ESP_RST_PANIC: return {"PANIC"};
+        case ESP_RST_INT_WDT: return {"INT_WDT"};
+        case ESP_RST_TASK_WDT: return {"TASK_WDT"};
+        case ESP_RST_WDT: return {"WDT"};
+        case ESP_RST_DEEPSLEEP: return {"DEEPSLEEP"};
+        case ESP_RST_BROWNOUT: return {"BROWNOUT"};
+        case ESP_RST_SDIO: return {"SDIO"};
+        default: return {"UNKNOWN"};
+      }
+    update_interval: 60s
+
+  - platform: version
+    name: "${dpi1c_desk} ESPHome Version"
+    id: ${desk_id}_esphome_version
+    entity_category: diagnostic
+
+  - platform: wifi_info
+    ip_address:
+      name: "${dpi1c_desk} IP Address"
+      id: ${desk_id}_ip_address
+      entity_category: diagnostic
+    ssid:
+      name: "${dpi1c_desk} Connected SSID"
+      id: ${desk_id}_connected_ssid
+      entity_category: diagnostic
+    bssid:
+      name: "${dpi1c_desk} Connected BSSID"
+      id: ${desk_id}_connected_bssid
+      entity_category: diagnostic
+
 # ============================================================
 # Binary Sensor
 # ============================================================
@@ -818,6 +963,23 @@ binary_sensor:
     name: "${dpi1c_desk} Moving"
     id: ${desk_id}_moving
     lambda: 'return id(${desk_id}_is_moving);'
+
+  - platform: template
+    name: "${dpi1c_desk} API Connected"
+    id: ${desk_id}_api_connected_sensor
+    entity_category: diagnostic
+    lambda: 'return id(${desk_id}_api_connected);'
+
+  - platform: template
+    name: "${dpi1c_desk} BLE Connected"
+    id: ${desk_id}_ble_connected_sensor
+    entity_category: diagnostic
+    lambda: 'return id(${desk_id}_ble_client)->connected();'
+
+  - platform: status
+    name: "${dpi1c_desk} ESPHome Status"
+    id: ${desk_id}_esphome_status
+    entity_category: diagnostic
 
 # ============================================================
 # Buttons
@@ -1094,6 +1256,24 @@ switch:
           id(${desk_id}_moving_to_target) = false;
           ESP_LOGI("status", "BLE Disconnected");
       - ble_client.disconnect: ${desk_id}_ble_client
+
+  - platform: template
+    name: "${dpi1c_desk} API Watchdog"
+    id: ${desk_id}_api_watchdog_switch
+    icon: 'mdi:lan-check'
+    entity_category: diagnostic
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - lambda: |-
+          id(${desk_id}_api_watchdog_enabled) = true;
+          id(${desk_id}_api_disconnected_since) = 0;
+          ESP_LOGW("api_watchdog", "API watchdog enabled: ESP32 will reboot after 10 minutes without API clients");
+    turn_off_action:
+      - lambda: |-
+          id(${desk_id}_api_watchdog_enabled) = false;
+          id(${desk_id}_api_disconnected_since) = 0;
+          ESP_LOGI("api_watchdog", "API watchdog disabled");
 
   # 키잠금 (Child Lock)
   - platform: template
