@@ -68,7 +68,7 @@ Add the following to your ESPHome device configuration `yaml` file.
 
 > [!NOTE]
 > This package only contains the desk logic. **You must still configure your board's basic settings** (such as `wifi`, `api`, `ota`, and your specific `esp32` board type) according to your own environment.
-> *(Note: `esp32_ble_tracker` with its `scan_parameters: active: true` setting is already included within this package, so you do **not** need to add it separately to your main file.)*
+> *(Note: `esp32_ble_tracker` with low-duty passive scan parameters is already included within this package, so you do **not** need to add it separately to your main file. Temporarily enable active scanning only while pairing/debugging if your desk cannot be discovered.)*
 
 ```yaml
 packages:
@@ -118,7 +118,7 @@ packages:
           log_level: "INFO"
 ```
 
-After compiling, the generated configuration should include diagnostic entities such as `API Connected`, `API Disconnected For`, `API Disconnect Count`, `BLE Connected`, `WiFi Signal`, `Uptime`, `Reset Reason`, and `API Watchdog`.
+After compiling, the generated configuration should include diagnostic entities such as `API Connected`, `API Disconnected For`, `API Disconnect Count`, `BLE Connected`, `BLE Reconnect Attempts`, `BLE Fail Count`, `BLE Forced Reboots`, `BLE Watchdog Reconnect In Progress`, `WiFi Signal`, `Uptime`, `Reset Reason`, and `API Watchdog`.
 
 ## How to Connect & Setup
 
@@ -136,6 +136,27 @@ If your ESPHome logs show `Connected successfully` but the data stream / pairing
 1. Turn **OFF** the BLE Connection switch in Home Assistant / ESPHome.
 2. Turn the BLE Connection switch back **ON**.
 3. Press and hold your desk controller's physical pairing button until the Bluetooth ID and Name appear on the display (forcing it into pairing mode). The ESP should now properly handshake.
+
+### BLE watchdog behavior
+The BLE Connection switch intentionally restores to **OFF** after boot. The package waits 60 seconds before turning it on so Wi-Fi, the native API, and the ESP32 Bluetooth stack can settle before GATT/pairing starts.
+
+If BLE gets stuck, the watchdog uses an explicit OFF -> delay -> ON reconnect sequence instead of repeatedly calling connect while ESPHome is already in `CONNECTING`. It warns after the last BLE notification is older than 180 seconds, force-reconnects after 300 seconds, and restarts the ESP if BLE remains disconnected for about 5 minutes or notifications stay stale for about 15 minutes.
+
+### Recovering from BLE bond/NVS corruption
+If logs show a previous boot crash around BLE authentication completion and NVS writes, for example `btc_dm_ble_auth_cmpl_evt`, `btc_config_flush`, `nvs_set_blob`, or `NVSPartition::read`, the ESP32 may have corrupted Bluetooth bond/auth data in flash. OTA uploads do not necessarily erase that NVS/Bluetooth bond storage.
+
+Use a one-time USB flash erase when the ESP repeatedly crashes or remains stuck in BLE `CONNECTING` after pairing:
+
+```bash
+esptool.py --chip esp32 --port /dev/ttyUSB0 erase_flash
+esphome run esp_ble_desk.yaml --device /dev/ttyUSB0
+```
+
+If your ESPHome setup handles flashing directly, run your normal command after the erase step:
+
+```bash
+esphome run esp_ble_desk.yaml --device /dev/ttyUSB0
+```
 
 ### Using the Mobile App while ESP is active
 If you ever need to connect the official `Desk Connect` mobile app while the ESP is already running:
