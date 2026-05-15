@@ -138,15 +138,15 @@ globals:
     restore_value: no
     initial_value: '0'
 
-  - id: ${desk_id}_ble_forced_reboots
-    type: int
-    restore_value: no
-    initial_value: '0'
-
   - id: ${desk_id}_ble_last_notify_age_max
     type: uint32_t
     restore_value: no
     initial_value: '0'
+
+  - id: ${desk_id}_ble_pairing_required
+    type: bool
+    restore_value: no
+    initial_value: 'false'
 
   # Watchdog: 복구 시도 단계 (0=정상, 1=disconnect시도, 2=GAP disconnect시도)
   - id: ${desk_id}_watchdog_stage
@@ -297,7 +297,8 @@ script:
             id(${desk_id}_handle_0011), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
           ESP_LOGD("init", "Read preset slot 3");
 
-  # BLE reconnect helper
+  # BLE reconnect helper. Do not toggle the HA BLE switch here: LINAK desks may
+  # require the physical pairing button after an intentional switch-off.
   - id: ${desk_id}_force_ble_reconnect
     mode: single
     then:
@@ -307,10 +308,14 @@ script:
           then:
             - lambda: |-
                 id(${desk_id}_ble_reconnect_in_progress) = true;
-                ESP_LOGW("watchdog", "BLE watchdog: force reconnect");
-            - switch.turn_off: ${desk_id}_ble_switch
+                ESP_LOGW("watchdog", "BLE watchdog: internal reconnect attempt");
+            - ble_client.disconnect: ${desk_id}_ble_client
             - delay: 10s
-            - switch.turn_on: ${desk_id}_ble_switch
+            - if:
+                condition:
+                  lambda: 'return id(${desk_id}_ble_enabled) && !id(${desk_id}_ble_pairing_required);'
+                then:
+                  - ble_client.connect: ${desk_id}_ble_client
             - delay: 90s
             - lambda: |-
                 id(${desk_id}_ble_reconnect_in_progress) = false;
@@ -575,7 +580,7 @@ ble_client:
         - delay: 3s
         - if:
             condition:
-              lambda: 'return id(${desk_id}_ble_enabled) && !id(${desk_id}_ble_reconnect_in_progress);'
+              lambda: 'return id(${desk_id}_ble_enabled) && !id(${desk_id}_ble_reconnect_in_progress) && !id(${desk_id}_ble_pairing_required);'
             then:
               - lambda: |-
                   id(${desk_id}_ble_reconnect_attempts) += 1;
@@ -626,6 +631,11 @@ interval:
             return;
           }
 
+          if (id(${desk_id}_ble_pairing_required)) {
+            ESP_LOGW("watchdog", "BLE recovery paused: press the desk pairing button, then turn BLE Connection on");
+            return;
+          }
+
           uint32_t now = millis();
           uint32_t last = id(${desk_id}_last_notify_ms);
           uint32_t notify_age_s = (last == 0) ? 0 : (now - last) / 1000;
@@ -636,7 +646,6 @@ interval:
           bool connected = id(${desk_id}_ble_client)->connected();
           bool notify_warning = connected && last != 0 && notify_age_s > 180;
           bool notify_stale = connected && last != 0 && notify_age_s > 300;
-          bool notify_reboot = connected && last != 0 && notify_age_s > 900;
 
           if (notify_warning) {
             ESP_LOGW("watchdog", "BLE notify age is %us", notify_age_s);
@@ -646,20 +655,19 @@ interval:
             id(${desk_id}_ble_fail_count) += 1;
             ESP_LOGW("watchdog", "BLE not connected for %d minute(s)", id(${desk_id}_ble_fail_count));
           } else if (notify_stale) {
-            if (id(${desk_id}_ble_fail_count) == 0) {
-              id(${desk_id}_ble_fail_count) = 1;
-            }
-            ESP_LOGW("watchdog", "BLE notify stale for %us", notify_age_s);
+            ESP_LOGW("watchdog", "BLE notify stale for %us; keeping link open and polling height", notify_age_s);
+            id(${desk_id}_ble_fail_count) = 0;
+            return;
           } else {
             id(${desk_id}_ble_fail_count) = 0;
             id(${desk_id}_watchdog_stage) = 0;
             return;
           }
 
-          if (notify_reboot || (!connected && id(${desk_id}_ble_fail_count) >= 5)) {
-            id(${desk_id}_ble_forced_reboots) += 1;
-            ESP_LOGE("watchdog", "BLE stuck, restarting ESP");
-            id(${desk_id}_restart_button).press();
+          if (!connected && id(${desk_id}_ble_fail_count) >= 5) {
+            id(${desk_id}_ble_pairing_required) = true;
+            id(${desk_id}_ble_reconnect_in_progress) = false;
+            ESP_LOGE("watchdog", "BLE disconnected for 5 minutes; desk likely requires physical pairing button");
             return;
           }
 
@@ -691,10 +699,10 @@ interval:
             return;
           }
 
-          // LINAK may stop height notifications while idle. Probe with a light read
-          // instead of treating quiet idle periods as a broken connection.
+          // LINAK may stop height notifications while idle. Keep the GATT link
+          // warm with a light height read instead of disconnecting.
           uint32_t last = id(${desk_id}_last_notify_ms);
-          if (last != 0 && id(${desk_id}_handle_0021) != 0 && millis() - last > 180000) {
+          if (id(${desk_id}_handle_0021) != 0 && (last == 0 || millis() - last > 60000)) {
             auto read_err = esp_ble_gattc_read_char(
               id(${desk_id}_ble_client)->get_gattc_if(),
               id(${desk_id}_ble_client)->get_conn_id(),
@@ -786,6 +794,7 @@ sensor:
       id(${desk_id}_last_notify_ms) = millis();
       id(${desk_id}_ble_fail_count) = 0;
       id(${desk_id}_ble_reconnect_in_progress) = false;
+      id(${desk_id}_ble_pairing_required) = false;
       id(${desk_id}_watchdog_stage) = 0;
 
       if (x.size() < 2 || x[0] != 0x01) return {};
@@ -877,6 +886,7 @@ sensor:
         id(${desk_id}_last_notify_ms) = millis();
         id(${desk_id}_ble_fail_count) = 0;
         id(${desk_id}_ble_reconnect_in_progress) = false;
+        id(${desk_id}_ble_pairing_required) = false;
         id(${desk_id}_watchdog_stage) = 0;
         uint16_t raw_height = (x[1] << 8) | x[0];
         int16_t raw_speed = (x[3] << 8) | x[2];
@@ -1002,16 +1012,6 @@ sensor:
     icon: 'mdi:counter'
     lambda: |-
       return (float)id(${desk_id}_ble_fail_count);
-    update_interval: 60s
-
-  - platform: template
-    name: "${dpi1c_desk} BLE Forced Reboots"
-    id: ${desk_id}_ble_forced_reboots_sensor
-    accuracy_decimals: 0
-    entity_category: diagnostic
-    icon: 'mdi:restart-alert'
-    lambda: |-
-      return (float)id(${desk_id}_ble_forced_reboots);
     update_interval: 60s
 
   - platform: template
@@ -1147,6 +1147,13 @@ binary_sensor:
     entity_category: diagnostic
     icon: 'mdi:bluetooth-connect'
     lambda: 'return id(${desk_id}_ble_reconnect_in_progress);'
+
+  - platform: template
+    name: "${dpi1c_desk} BLE Pairing Required"
+    id: ${desk_id}_ble_pairing_required_sensor
+    entity_category: diagnostic
+    icon: 'mdi:gesture-tap-button'
+    lambda: 'return id(${desk_id}_ble_pairing_required);'
 
   - platform: status
     name: "${dpi1c_desk} ESPHome Status"
@@ -1424,11 +1431,13 @@ switch:
     turn_on_action:
       - lambda: |-
           id(${desk_id}_ble_enabled) = true;
+          id(${desk_id}_ble_pairing_required) = false;
           ESP_LOGI("status", "Attempting BLE connection");
       - ble_client.connect: ${desk_id}_ble_client
     turn_off_action:
       - lambda: |-
           id(${desk_id}_ble_enabled) = false;
+          id(${desk_id}_ble_pairing_required) = false;
           id(${desk_id}_is_moving) = false;
           id(${desk_id}_moving_to_target) = false;
           ESP_LOGI("status", "BLE Disconnected");

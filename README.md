@@ -118,7 +118,7 @@ packages:
           log_level: "INFO"
 ```
 
-After compiling, the generated configuration should include diagnostic entities such as `API Connected`, `API Disconnected For`, `API Disconnect Count`, `BLE Connected`, `BLE Reconnect Attempts`, `BLE Fail Count`, `BLE Forced Reboots`, `BLE Watchdog Reconnect In Progress`, `WiFi Signal`, `Uptime`, `Reset Reason`, and `API Watchdog`.
+After compiling, the generated configuration should include diagnostic entities such as `API Connected`, `API Disconnected For`, `API Disconnect Count`, `BLE Connected`, `BLE Reconnect Attempts`, `BLE Fail Count`, `BLE Pairing Required`, `BLE Watchdog Reconnect In Progress`, `WiFi Signal`, `Uptime`, `Reset Reason`, and `API Watchdog`.
 
 ## How to Connect & Setup
 
@@ -140,7 +140,9 @@ If your ESPHome logs show `Connected successfully` but the data stream / pairing
 ### BLE watchdog behavior
 The BLE Connection switch intentionally restores to **OFF** after boot. The package waits 60 seconds before turning it on so Wi-Fi, the native API, and the ESP32 Bluetooth stack can settle before GATT/pairing starts.
 
-If BLE gets stuck, the watchdog uses an explicit OFF -> delay -> ON reconnect sequence instead of repeatedly calling connect while ESPHome is already in `CONNECTING`. It warns after the last BLE notification is older than 180 seconds, force-reconnects after 300 seconds, and restarts the ESP if BLE remains disconnected for about 5 minutes or notifications stay stale for about 15 minutes.
+If BLE gets stuck, the watchdog uses an internal disconnect -> delay -> connect attempt instead of toggling the Home Assistant BLE Connection switch or repeatedly calling connect while ESPHome is already in `CONNECTING`. This matters because some LINAK desks require the physical pairing button after an intentional BLE switch-off.
+
+The watchdog warns after the last BLE notification is older than 180 seconds. While BLE is still connected, it keeps the link open and polls the height characteristic instead of disconnecting. If BLE is already disconnected for about 5 minutes, it raises the `BLE Pairing Required` diagnostic and pauses automatic recovery. Press the desk's physical pairing button, then turn the BLE Connection switch on again.
 
 ### Recovering from BLE bond/NVS corruption
 If logs show a previous boot crash around BLE authentication completion and NVS writes, for example `btc_dm_ble_auth_cmpl_evt`, `btc_config_flush`, `nvs_set_blob`, or `NVSPartition::read`, the ESP32 may have corrupted Bluetooth bond/auth data in flash. OTA uploads do not necessarily erase that NVS/Bluetooth bond storage.
