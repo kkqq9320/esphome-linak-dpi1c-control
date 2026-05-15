@@ -144,22 +144,6 @@ If BLE gets stuck, the watchdog uses an internal disconnect -> delay -> connect 
 
 The watchdog warns after the last BLE notification is older than 180 seconds. While BLE is still connected, it keeps the link open and polls the height characteristic instead of disconnecting. If BLE is already disconnected for about 5 minutes, it raises the `BLE Pairing Required` diagnostic and pauses automatic recovery. Press the desk's physical pairing button, then turn the BLE Connection switch on again.
 
-### Recovering from BLE bond/NVS corruption
-If logs show a previous boot crash around BLE authentication completion and NVS writes, for example `btc_dm_ble_auth_cmpl_evt`, `btc_config_flush`, `nvs_set_blob`, or `NVSPartition::read`, the ESP32 may have corrupted Bluetooth bond/auth data in flash. OTA uploads do not necessarily erase that NVS/Bluetooth bond storage.
-
-Use a one-time USB flash erase when the ESP repeatedly crashes or remains stuck in BLE `CONNECTING` after pairing:
-
-```bash
-esptool.py --chip esp32 --port /dev/ttyUSB0 erase_flash
-esphome run esp_ble_desk.yaml --device /dev/ttyUSB0
-```
-
-If your ESPHome setup handles flashing directly, run your normal command after the erase step:
-
-```bash
-esphome run esp_ble_desk.yaml --device /dev/ttyUSB0
-```
-
 ### Using the Mobile App while ESP is active
 If you ever need to connect the official `Desk Connect` mobile app while the ESP is already running:
 1. Turn **OFF** the BLE Connection switch via Home Assistant.
