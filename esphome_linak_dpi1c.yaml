@@ -123,12 +123,27 @@ globals:
     type: uint32_t
     initial_value: '0'
 
+  - id: ${desk_id}_ble_connected_since_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+  - id: ${desk_id}_ble_seen_notify
+    type: bool
+    restore_value: no
+    initial_value: 'false'
+
   - id: ${desk_id}_ble_reconnect_in_progress
     type: bool
     restore_value: no
     initial_value: 'false'
 
   - id: ${desk_id}_ble_fail_count
+    type: int
+    restore_value: no
+    initial_value: '0'
+
+  - id: ${desk_id}_ble_no_notify_count
     type: int
     restore_value: no
     initial_value: '0'
@@ -547,6 +562,15 @@ ble_client:
       then:
         - lambda: |-
             // handle 캐시
+            id(${desk_id}_ble_connected_since_ms) = millis();
+            id(${desk_id}_ble_seen_notify) = false;
+
+            // Clear stale handles before caching the new GATT table.
+            id(${desk_id}_handle_ctrl) = 0;
+            id(${desk_id}_handle_0011) = 0;
+            id(${desk_id}_handle_0021) = 0;
+            id(${desk_id}_handle_move) = 0;
+
             struct { const char* svc; const char* chr; uint16_t* out; const char* name; } chars[] = {
               {"99fa0001-338a-1024-8a49-009c0215f78a", "99fa0002-338a-1024-8a49-009c0215f78a", &id(${desk_id}_handle_ctrl), "ctrl"},
               {"99fa0010-338a-1024-8a49-009c0215f78a", "99fa0011-338a-1024-8a49-009c0215f78a", &id(${desk_id}_handle_0011), "0011"},
@@ -562,10 +586,7 @@ ble_client:
                 ESP_LOGD("status", "%s handle=0x%04X", c.name, ch->handle);
               }
             }
-            // 연결 시 watchdog 기준점 설정 — notify가 안 오면 3분 후 감지
-            // stage는 여기서 리셋하지 않음 — notify 수신 시에만 리셋
-            id(${desk_id}_last_notify_ms) = millis();
-
+            // Watchdog is reset only after a real notification is received.
         - script.execute: ${desk_id}_init_sequence
 
     on_disconnect:
@@ -577,6 +598,12 @@ ble_client:
             id(${desk_id}_moving_to_target) = false;
             id(${desk_id}_notify_registered) = false;
             id(${desk_id}_stall_since) = 0;
+            id(${desk_id}_ble_connected_since_ms) = 0;
+            id(${desk_id}_ble_seen_notify) = false;
+            id(${desk_id}_handle_ctrl) = 0;
+            id(${desk_id}_handle_0011) = 0;
+            id(${desk_id}_handle_0021) = 0;
+            id(${desk_id}_handle_move) = 0;
         - delay: 3s
         - if:
             condition:
@@ -627,6 +654,9 @@ interval:
       - lambda: |-
           if (!id(${desk_id}_ble_enabled)) {
             id(${desk_id}_ble_fail_count) = 0;
+            id(${desk_id}_ble_no_notify_count) = 0;
+            id(${desk_id}_ble_connected_since_ms) = 0;
+            id(${desk_id}_ble_seen_notify) = false;
             id(${desk_id}_ble_reconnect_in_progress) = false;
             return;
           }
@@ -654,6 +684,28 @@ interval:
           if (!connected) {
             id(${desk_id}_ble_fail_count) += 1;
             ESP_LOGW("watchdog", "BLE not connected for %d minute(s)", id(${desk_id}_ble_fail_count));
+          } else if (!id(${desk_id}_ble_seen_notify)) {
+            id(${desk_id}_ble_fail_count) = 0;
+            uint32_t connected_since = id(${desk_id}_ble_connected_since_ms);
+            if (connected_since == 0) {
+              connected_since = now;
+              id(${desk_id}_ble_connected_since_ms) = now;
+            }
+            uint32_t connected_age_s = (now - connected_since) / 1000;
+            if (connected_age_s <= 120) {
+              ESP_LOGD("watchdog", "BLE connected, waiting for first notify (%us)", connected_age_s);
+              return;
+            }
+            id(${desk_id}_ble_no_notify_count) += 1;
+            ESP_LOGW("watchdog", "BLE connected for %us without notify; reconnect probe %d",
+                     connected_age_s, id(${desk_id}_ble_no_notify_count));
+            if (id(${desk_id}_ble_no_notify_count) >= 3) {
+              id(${desk_id}_ble_pairing_required) = true;
+              id(${desk_id}_ble_reconnect_in_progress) = false;
+              ESP_LOGE("watchdog", "BLE connected but never received notify; desk likely needs physical pairing");
+              id(${desk_id}_ble_client)->disconnect();
+              return;
+            }
           } else if (notify_stale) {
             ESP_LOGW("watchdog", "BLE notify stale for %us; keeping link open and polling height", notify_age_s);
             id(${desk_id}_ble_fail_count) = 0;
@@ -792,7 +844,9 @@ sensor:
       }
       ESP_LOGD("status", "[%d bytes]: %s", x.size(), hex_str.c_str());
       id(${desk_id}_last_notify_ms) = millis();
+      id(${desk_id}_ble_seen_notify) = true;
       id(${desk_id}_ble_fail_count) = 0;
+      id(${desk_id}_ble_no_notify_count) = 0;
       id(${desk_id}_ble_reconnect_in_progress) = false;
       id(${desk_id}_ble_pairing_required) = false;
       id(${desk_id}_watchdog_stage) = 0;
@@ -884,7 +938,9 @@ sensor:
     lambda: |-
       if (x.size() >= 4) {
         id(${desk_id}_last_notify_ms) = millis();
+        id(${desk_id}_ble_seen_notify) = true;
         id(${desk_id}_ble_fail_count) = 0;
+        id(${desk_id}_ble_no_notify_count) = 0;
         id(${desk_id}_ble_reconnect_in_progress) = false;
         id(${desk_id}_ble_pairing_required) = false;
         id(${desk_id}_watchdog_stage) = 0;
@@ -1015,6 +1071,16 @@ sensor:
     update_interval: 60s
 
   - platform: template
+    name: "${dpi1c_desk} BLE No Notify Count"
+    id: ${desk_id}_ble_no_notify_count_sensor
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    icon: 'mdi:counter'
+    lambda: |-
+      return (float)id(${desk_id}_ble_no_notify_count);
+    update_interval: 60s
+
+  - platform: template
     name: "${dpi1c_desk} BLE Last Notify Age Max"
     id: ${desk_id}_ble_last_notify_age_max_sensor
     unit_of_measurement: 's'
@@ -1140,6 +1206,13 @@ binary_sensor:
     id: ${desk_id}_ble_connected_sensor
     entity_category: diagnostic
     lambda: 'return id(${desk_id}_ble_client)->connected();'
+
+  - platform: template
+    name: "${dpi1c_desk} BLE Notify Seen"
+    id: ${desk_id}_ble_notify_seen_sensor
+    entity_category: diagnostic
+    icon: 'mdi:bell-check'
+    lambda: 'return id(${desk_id}_ble_seen_notify);'
 
   - platform: template
     name: "${dpi1c_desk} BLE Watchdog Reconnect In Progress"
@@ -1432,12 +1505,18 @@ switch:
       - lambda: |-
           id(${desk_id}_ble_enabled) = true;
           id(${desk_id}_ble_pairing_required) = false;
+          id(${desk_id}_ble_no_notify_count) = 0;
+          id(${desk_id}_ble_connected_since_ms) = 0;
+          id(${desk_id}_ble_seen_notify) = false;
           ESP_LOGI("status", "Attempting BLE connection");
       - ble_client.connect: ${desk_id}_ble_client
     turn_off_action:
       - lambda: |-
           id(${desk_id}_ble_enabled) = false;
           id(${desk_id}_ble_pairing_required) = false;
+          id(${desk_id}_ble_no_notify_count) = 0;
+          id(${desk_id}_ble_connected_since_ms) = 0;
+          id(${desk_id}_ble_seen_notify) = false;
           id(${desk_id}_is_moving) = false;
           id(${desk_id}_moving_to_target) = false;
           ESP_LOGI("status", "BLE Disconnected");
