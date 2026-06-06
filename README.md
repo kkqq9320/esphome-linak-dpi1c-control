@@ -68,7 +68,7 @@ Add the following to your ESPHome device configuration `yaml` file.
 
 > [!NOTE]
 > This package only contains the desk logic. **You must still configure your board's basic settings** (such as `wifi`, `api`, `ota`, and your specific `esp32` board type) according to your own environment.
-> *(Note: `esp32_ble_tracker` with low-duty passive scan parameters is already included within this package, so you do **not** need to add it separately to your main file. Temporarily enable active scanning only while pairing/debugging if your desk cannot be discovered.)*
+> *(Note: `esp32_ble_tracker` with its `scan_parameters: active: true` setting is already included within this package, so you do **not** need to add it separately to your main file.)*
 
 ```yaml
 packages:
@@ -99,27 +99,6 @@ packages:
 
 ```
 
-### Testing the feature branch
-
-When testing `feature/ble-watchdog`, pin the package to that branch and force a refresh so ESPHome does not compile the cached `main` package:
-
-```yaml
-packages:
-  esphome_linak_dpi1c:
-    url: https://github.com/kkqq9320/esphome-linak-dpi1c-control/
-    ref: feature/ble-watchdog
-    refresh: 0s
-    files:
-      - path: esphome_linak_dpi1c.yaml
-        vars:
-          dpi1c_desk: "Desker"
-          desk_id: "desker_id1"
-          mac_addr: "CA:07:XX:XX:XX:XX"
-          log_level: "INFO"
-```
-
-After compiling, the generated configuration should include diagnostic entities such as `API Connected`, `API Disconnected For`, `API Disconnect Count`, `BLE Connected`, `BLE Reconnect Attempts`, `BLE Fail Count`, `BLE Pairing Required`, `BLE Watchdog Reconnect In Progress`, `WiFi Signal`, `Uptime`, `Reset Reason`, and `API Watchdog`.
-
 ## How to Connect & Setup
 
 Follow these exact steps to pair the ESP32 board to your desk for the first time:
@@ -136,13 +115,6 @@ If your ESPHome logs show `Connected successfully` but the data stream / pairing
 1. Turn **OFF** the BLE Connection switch in Home Assistant / ESPHome.
 2. Turn the BLE Connection switch back **ON**.
 3. Press and hold your desk controller's physical pairing button until the Bluetooth ID and Name appear on the display (forcing it into pairing mode). The ESP should now properly handshake.
-
-### BLE watchdog behavior
-The BLE Connection switch intentionally restores to **OFF** after boot. The package waits 60 seconds before turning it on so Wi-Fi, the native API, and the ESP32 Bluetooth stack can settle before GATT/pairing starts.
-
-If BLE gets stuck, the watchdog uses an internal disconnect -> delay -> connect attempt instead of toggling the Home Assistant BLE Connection switch or repeatedly calling connect while ESPHome is already in `CONNECTING`. This matters because some LINAK desks require the physical pairing button after an intentional BLE switch-off.
-
-The watchdog warns after the last BLE notification is older than 180 seconds. While BLE is still connected, it keeps the link open and polls the height characteristic instead of disconnecting. If BLE is already disconnected for about 5 minutes, it raises the `BLE Pairing Required` diagnostic and pauses automatic recovery. Press the desk's physical pairing button, then turn the BLE Connection switch on again.
 
 ### Using the Mobile App while ESP is active
 If you ever need to connect the official `Desk Connect` mobile app while the ESP is already running:
