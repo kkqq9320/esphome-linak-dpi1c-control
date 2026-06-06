@@ -63,6 +63,10 @@ api:
         id(${desk_id}_api_disconnect_count)++;
         ESP_LOGW("api_watchdog", "API client disconnected: %s (%s), count=%u",
                  client_info.c_str(), client_address.c_str(), id(${desk_id}_api_disconnect_count));
+
+time:
+  - platform: homeassistant
+    id: ${desk_id}_ha_time
 # ============================================================
 # LINAK DPI1C Desk BLE Control for ESPHome (v2 — HCI 로그 기반)
 # Controller: DPI1C000011006 / MAC: 
@@ -594,6 +598,21 @@ ble_client:
         - logger.log: "BLE Disconnected"
         - script.stop: ${desk_id}_move_loop
         - lambda: |-
+            if (id(${desk_id}_ble_enabled) &&
+                !id(${desk_id}_ble_reconnect_in_progress) &&
+                !id(${desk_id}_ble_pairing_required)) {
+              auto now = id(${desk_id}_ha_time).now();
+              std::string stamp;
+              if (now.is_valid()) {
+                stamp = now.strftime("%Y-%m-%d %H:%M:%S");
+              } else {
+                char fallback[32];
+                snprintf(fallback, sizeof(fallback), "uptime %us", millis() / 1000);
+                stamp = fallback;
+              }
+              id(${desk_id}_ble_last_disconnect_at).publish_state(stamp);
+              id(${desk_id}_ble_last_disconnect_reason).publish_state("BLE disconnected");
+            }
             id(${desk_id}_is_moving) = false;
             id(${desk_id}_moving_to_target) = false;
             id(${desk_id}_notify_registered) = false;
@@ -702,6 +721,17 @@ interval:
             if (id(${desk_id}_ble_no_notify_count) >= 3) {
               id(${desk_id}_ble_pairing_required) = true;
               id(${desk_id}_ble_reconnect_in_progress) = false;
+              auto event_time = id(${desk_id}_ha_time).now();
+              std::string stamp;
+              if (event_time.is_valid()) {
+                stamp = event_time.strftime("%Y-%m-%d %H:%M:%S");
+              } else {
+                char fallback[32];
+                snprintf(fallback, sizeof(fallback), "uptime %us", millis() / 1000);
+                stamp = fallback;
+              }
+              id(${desk_id}_ble_last_disconnect_at).publish_state(stamp);
+              id(${desk_id}_ble_last_disconnect_reason).publish_state("Connected without notify");
               ESP_LOGE("watchdog", "BLE connected but never received notify; desk likely needs physical pairing");
               id(${desk_id}_ble_client)->disconnect();
               return;
@@ -719,6 +749,17 @@ interval:
           if (!connected && id(${desk_id}_ble_fail_count) >= 5) {
             id(${desk_id}_ble_pairing_required) = true;
             id(${desk_id}_ble_reconnect_in_progress) = false;
+            auto event_time = id(${desk_id}_ha_time).now();
+            std::string stamp;
+            if (event_time.is_valid()) {
+              stamp = event_time.strftime("%Y-%m-%d %H:%M:%S");
+            } else {
+              char fallback[32];
+              snprintf(fallback, sizeof(fallback), "uptime %us", millis() / 1000);
+              stamp = fallback;
+            }
+            id(${desk_id}_ble_last_disconnect_at).publish_state(stamp);
+            id(${desk_id}_ble_last_disconnect_reason).publish_state("Disconnected for 5 minutes");
             ESP_LOGE("watchdog", "BLE disconnected for 5 minutes; desk likely requires physical pairing button");
             return;
           }
@@ -744,6 +785,19 @@ interval:
             ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
           if (err != ESP_OK) {
             ESP_LOGW("watchdog", "Heartbeat write failed (err=%d), forcing reconnect", err);
+            auto event_time = id(${desk_id}_ha_time).now();
+            std::string stamp;
+            if (event_time.is_valid()) {
+              stamp = event_time.strftime("%Y-%m-%d %H:%M:%S");
+            } else {
+              char fallback[32];
+              snprintf(fallback, sizeof(fallback), "uptime %us", millis() / 1000);
+              stamp = fallback;
+            }
+            char reason[64];
+            snprintf(reason, sizeof(reason), "Heartbeat write failed (err=%d)", err);
+            id(${desk_id}_ble_last_disconnect_at).publish_state(stamp);
+            id(${desk_id}_ble_last_disconnect_reason).publish_state(reason);
             if (!id(${desk_id}_ble_reconnect_in_progress)) {
               id(${desk_id}_ble_reconnect_attempts) += 1;
               id(${desk_id}_force_ble_reconnect).execute();
@@ -1144,6 +1198,20 @@ text_sensor:
   - platform: template
     name: "${dpi1c_desk} Motor Direction"
     id: ${desk_id}_motor_direction
+    update_interval: never
+
+  - platform: template
+    name: "${dpi1c_desk} BLE Last Disconnect At"
+    id: ${desk_id}_ble_last_disconnect_at
+    entity_category: diagnostic
+    icon: 'mdi:clock-alert-outline'
+    update_interval: never
+
+  - platform: template
+    name: "${dpi1c_desk} BLE Last Disconnect Reason"
+    id: ${desk_id}_ble_last_disconnect_reason
+    entity_category: diagnostic
+    icon: 'mdi:alert-circle-outline'
     update_interval: never
 
   - platform: template
