@@ -21,12 +21,9 @@
 logger:
   level: ${log_level}
 
-esp32_ble_tracker:
-  scan_parameters:
-    # Keep scan duty low for normal operation; use active scan only while pairing/debugging.
-    active: false
-    interval: 1200ms
-    window: 100ms
+esp32_ble_tracker:     
+  scan_parameters:    
+    active: true
 
 # ============================================================
 # Boot
@@ -35,34 +32,12 @@ esphome:
   on_boot:
     priority: -100
     then:
-      - logger.log:
-          tag: watchdog
-          format: "BLE boot cooldown before connect"
-      - delay: 60s
+      - delay: 5s
       - if:
           condition:
             lambda: 'return id(${desk_id}_ble_enabled);'
           then:
-            - switch.turn_on: ${desk_id}_ble_switch
-
-# ============================================================
-# Native API diagnostics
-# ============================================================
-# 사용자 메인 YAML의 api.encryption 설정과 병합되어 동작합니다.
-api:
-  on_client_connected:
-    - lambda: |-
-        id(${desk_id}_api_last_connected_ms) = millis();
-        id(${desk_id}_api_disconnected_since) = 0;
-        id(${desk_id}_api_connected) = true;
-        ESP_LOGI("api_watchdog", "API client connected: %s (%s)", client_info.c_str(), client_address.c_str());
-
-  on_client_disconnected:
-    - lambda: |-
-        id(${desk_id}_api_last_disconnected_ms) = millis();
-        id(${desk_id}_api_disconnect_count)++;
-        ESP_LOGW("api_watchdog", "API client disconnected: %s (%s), count=%u",
-                 client_info.c_str(), client_address.c_str(), id(${desk_id}_api_disconnect_count));
+            - ble_client.connect: ${desk_id}_ble_client
 # ============================================================
 # LINAK DPI1C Desk BLE Control for ESPHome (v2 — HCI 로그 기반)
 # Controller: DPI1C000011006 / MAC: 
@@ -118,76 +93,6 @@ globals:
     type: bool
     initial_value: 'false'
 
-  # Watchdog: 마지막 notify 수신 시각 (millis)
-  - id: ${desk_id}_last_notify_ms
-    type: uint32_t
-    initial_value: '0'
-
-  - id: ${desk_id}_ble_connected_since_ms
-    type: uint32_t
-    restore_value: no
-    initial_value: '0'
-
-  - id: ${desk_id}_ble_seen_notify
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-
-  - id: ${desk_id}_ble_reconnect_in_progress
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-
-  - id: ${desk_id}_ble_fail_count
-    type: int
-    restore_value: no
-    initial_value: '0'
-
-  - id: ${desk_id}_ble_no_notify_count
-    type: int
-    restore_value: no
-    initial_value: '0'
-
-  - id: ${desk_id}_ble_reconnect_attempts
-    type: int
-    restore_value: no
-    initial_value: '0'
-
-  - id: ${desk_id}_ble_last_notify_age_max
-    type: uint32_t
-    restore_value: no
-    initial_value: '0'
-
-  - id: ${desk_id}_ble_pairing_required
-    type: bool
-    restore_value: no
-    initial_value: 'false'
-
-  # Watchdog: 복구 시도 단계 (0=정상, 1=disconnect시도, 2=GAP disconnect시도)
-  - id: ${desk_id}_watchdog_stage
-    type: uint8_t
-    initial_value: '0'
-
-  # Native API diagnostics: HA/ESPHome API 연결 상태 추적
-  - id: ${desk_id}_api_connected
-    type: bool
-    initial_value: 'false'
-  - id: ${desk_id}_api_disconnected_since
-    type: uint32_t
-    initial_value: '0'
-  - id: ${desk_id}_api_last_connected_ms
-    type: uint32_t
-    initial_value: '0'
-  - id: ${desk_id}_api_last_disconnected_ms
-    type: uint32_t
-    initial_value: '0'
-  - id: ${desk_id}_api_disconnect_count
-    type: uint32_t
-    initial_value: '0'
-  - id: ${desk_id}_api_watchdog_enabled
-    type: bool
-    initial_value: 'false'
-
   # GATT handles
   - id: ${desk_id}_handle_ctrl
     type: uint16_t
@@ -240,11 +145,24 @@ script:
           }
       - delay: 2s
 
-      # CCCD 등록은 ESPHome ble_client 센서의 notify: true가 자동 관리
-      # 수동 등록은 충돌을 일으키므로 제거됨
+      # CCCD 등록
       - lambda: |-
+          if (!id(${desk_id}_ble_client)->connected()) return;
+          auto gattc_if = id(${desk_id}_ble_client)->get_gattc_if();
+          auto conn_id  = id(${desk_id}_ble_client)->get_conn_id();
+          uint8_t en[] = {0x01, 0x00};
+
+          uint16_t handles[] = { id(${desk_id}_handle_0021), id(${desk_id}_handle_0011) };
+          const char* names[] = { "0021", "0011" };
+          for (int i = 0; i < 2; i++) {
+            if (handles[i] == 0) continue;
+            esp_ble_gattc_register_for_notify(gattc_if, id(${desk_id}_ble_client)->get_remote_bda(), handles[i]);
+            uint16_t cccd = handles[i] + 1;
+            esp_ble_gattc_write_char_descr(gattc_if, conn_id, cccd, sizeof(en), en,
+              ESP_GATT_WRITE_TYPE_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
+            ESP_LOGD("init", "CCCD registered: %s (handle=0x%04X)", names[i], handles[i]);
+          }
           id(${desk_id}_notify_registered) = true;
-          ESP_LOGD("init", "Notify registration delegated to ESPHome ble_client");
       - delay: 300ms
 
       # Init 1/3: 7F 80 00
@@ -311,29 +229,6 @@ script:
           esp_ble_gattc_write_char(id(${desk_id}_ble_client)->get_gattc_if(), id(${desk_id}_ble_client)->get_conn_id(),
             id(${desk_id}_handle_0011), sizeof(cmd), cmd, ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
           ESP_LOGD("init", "Read preset slot 3");
-
-  # BLE reconnect helper. Do not toggle the HA BLE switch here: LINAK desks may
-  # require the physical pairing button after an intentional switch-off.
-  - id: ${desk_id}_force_ble_reconnect
-    mode: single
-    then:
-      - if:
-          condition:
-            lambda: 'return !id(${desk_id}_ble_reconnect_in_progress);'
-          then:
-            - lambda: |-
-                id(${desk_id}_ble_reconnect_in_progress) = true;
-                ESP_LOGW("watchdog", "BLE watchdog: internal reconnect attempt");
-            - ble_client.disconnect: ${desk_id}_ble_client
-            - delay: 10s
-            - if:
-                condition:
-                  lambda: 'return id(${desk_id}_ble_enabled) && !id(${desk_id}_ble_pairing_required);'
-                then:
-                  - ble_client.connect: ${desk_id}_ble_client
-            - delay: 90s
-            - lambda: |-
-                id(${desk_id}_ble_reconnect_in_progress) = false;
 
   # ── 이동 루프 ──
   - id: ${desk_id}_move_loop
@@ -562,15 +457,6 @@ ble_client:
       then:
         - lambda: |-
             // handle 캐시
-            id(${desk_id}_ble_connected_since_ms) = millis();
-            id(${desk_id}_ble_seen_notify) = false;
-
-            // Clear stale handles before caching the new GATT table.
-            id(${desk_id}_handle_ctrl) = 0;
-            id(${desk_id}_handle_0011) = 0;
-            id(${desk_id}_handle_0021) = 0;
-            id(${desk_id}_handle_move) = 0;
-
             struct { const char* svc; const char* chr; uint16_t* out; const char* name; } chars[] = {
               {"99fa0001-338a-1024-8a49-009c0215f78a", "99fa0002-338a-1024-8a49-009c0215f78a", &id(${desk_id}_handle_ctrl), "ctrl"},
               {"99fa0010-338a-1024-8a49-009c0215f78a", "99fa0011-338a-1024-8a49-009c0215f78a", &id(${desk_id}_handle_0011), "0011"},
@@ -586,7 +472,7 @@ ble_client:
                 ESP_LOGD("status", "%s handle=0x%04X", c.name, ch->handle);
               }
             }
-            // Watchdog is reset only after a real notification is received.
+
         - script.execute: ${desk_id}_init_sequence
 
     on_disconnect:
@@ -598,228 +484,30 @@ ble_client:
             id(${desk_id}_moving_to_target) = false;
             id(${desk_id}_notify_registered) = false;
             id(${desk_id}_stall_since) = 0;
-            id(${desk_id}_ble_connected_since_ms) = 0;
-            id(${desk_id}_ble_seen_notify) = false;
-            id(${desk_id}_handle_ctrl) = 0;
-            id(${desk_id}_handle_0011) = 0;
-            id(${desk_id}_handle_0021) = 0;
-            id(${desk_id}_handle_move) = 0;
         - delay: 3s
         - if:
             condition:
-              lambda: 'return id(${desk_id}_ble_enabled) && !id(${desk_id}_ble_reconnect_in_progress) && !id(${desk_id}_ble_pairing_required);'
+              lambda: 'return id(${desk_id}_ble_enabled);'
             then:
-              - lambda: |-
-                  id(${desk_id}_ble_reconnect_attempts) += 1;
-                  ESP_LOGW("watchdog", "BLE disconnected, scheduling force reconnect");
-              - script.execute: ${desk_id}_force_ble_reconnect
+              - ble_client.connect: ${desk_id}_ble_client
 
 
 # ============================================================
 # Interval
 # ============================================================
 interval:
-  # Native API 상태 추적 — HA에서 끊겼는지, BLE만 끊겼는지 분리해서 보기 위함
-  - interval: 30s
-    then:
-      - if:
-          condition:
-            api.connected:
-          then:
-            - lambda: |-
-                if (!id(${desk_id}_api_connected)) {
-                  ESP_LOGI("api_watchdog", "API connection recovered");
-                }
-                id(${desk_id}_api_connected) = true;
-                id(${desk_id}_api_disconnected_since) = 0;
-          else:
-            - lambda: |-
-                uint32_t now = millis();
-                if (id(${desk_id}_api_disconnected_since) == 0) {
-                  id(${desk_id}_api_disconnected_since) = now;
-                  ESP_LOGW("api_watchdog", "No API client connected");
-                }
-                id(${desk_id}_api_connected) = false;
-
-                uint32_t elapsed = now - id(${desk_id}_api_disconnected_since);
-                if (id(${desk_id}_api_watchdog_enabled) && elapsed > 600000) {
-                  ESP_LOGE("api_watchdog", "API disconnected for %us, rebooting ESP32", elapsed / 1000);
-                  delay(100);
-                  esp_restart();
-                }
-
-  # BLE watchdog reconnect and stale-notify recovery
+  # Heartbeat (연결 유지) — 이동 중이 아닐 때만
   - interval: 60s
-    then:
-      - lambda: |-
-          if (!id(${desk_id}_ble_enabled)) {
-            id(${desk_id}_ble_fail_count) = 0;
-            id(${desk_id}_ble_no_notify_count) = 0;
-            id(${desk_id}_ble_connected_since_ms) = 0;
-            id(${desk_id}_ble_seen_notify) = false;
-            id(${desk_id}_ble_reconnect_in_progress) = false;
-            return;
-          }
-
-          if (id(${desk_id}_ble_pairing_required)) {
-            ESP_LOGW("watchdog", "BLE recovery paused: press the desk pairing button, then turn BLE Connection on");
-            return;
-          }
-
-          uint32_t now = millis();
-          uint32_t last = id(${desk_id}_last_notify_ms);
-          uint32_t notify_age_s = (last == 0) ? 0 : (now - last) / 1000;
-          if (notify_age_s > id(${desk_id}_ble_last_notify_age_max)) {
-            id(${desk_id}_ble_last_notify_age_max) = notify_age_s;
-          }
-
-          bool connected = id(${desk_id}_ble_client)->connected();
-          bool notify_warning = connected && last != 0 && notify_age_s > 180;
-          bool notify_stale = connected && last != 0 && notify_age_s > 300;
-
-          if (notify_warning) {
-            ESP_LOGW("watchdog", "BLE notify age is %us", notify_age_s);
-          }
-
-          if (!connected) {
-            id(${desk_id}_ble_fail_count) += 1;
-            ESP_LOGW("watchdog", "BLE not connected for %d minute(s)", id(${desk_id}_ble_fail_count));
-          } else if (!id(${desk_id}_ble_seen_notify)) {
-            id(${desk_id}_ble_fail_count) = 0;
-            uint32_t connected_since = id(${desk_id}_ble_connected_since_ms);
-            if (connected_since == 0) {
-              connected_since = now;
-              id(${desk_id}_ble_connected_since_ms) = now;
-            }
-            uint32_t connected_age_s = (now - connected_since) / 1000;
-            if (connected_age_s <= 120) {
-              ESP_LOGD("watchdog", "BLE connected, waiting for first notify (%us)", connected_age_s);
-              return;
-            }
-            id(${desk_id}_ble_no_notify_count) += 1;
-            ESP_LOGW("watchdog", "BLE connected for %us without notify; reconnect probe %d",
-                     connected_age_s, id(${desk_id}_ble_no_notify_count));
-            if (id(${desk_id}_ble_no_notify_count) >= 3) {
-              id(${desk_id}_ble_pairing_required) = true;
-              id(${desk_id}_ble_reconnect_in_progress) = false;
-              ESP_LOGE("watchdog", "BLE connected but never received notify; desk likely needs physical pairing");
-              id(${desk_id}_ble_client)->disconnect();
-              return;
-            }
-          } else if (notify_stale) {
-            ESP_LOGW("watchdog", "BLE notify stale for %us; keeping link open and polling height", notify_age_s);
-            id(${desk_id}_ble_fail_count) = 0;
-            return;
-          } else {
-            id(${desk_id}_ble_fail_count) = 0;
-            id(${desk_id}_watchdog_stage) = 0;
-            return;
-          }
-
-          if (!connected && id(${desk_id}_ble_fail_count) >= 5) {
-            id(${desk_id}_ble_pairing_required) = true;
-            id(${desk_id}_ble_reconnect_in_progress) = false;
-            ESP_LOGE("watchdog", "BLE disconnected for 5 minutes; desk likely requires physical pairing button");
-            return;
-          }
-
-          if (!id(${desk_id}_ble_reconnect_in_progress)) {
-            id(${desk_id}_ble_reconnect_attempts) += 1;
-            id(${desk_id}_force_ble_reconnect).execute();
-          } else {
-            ESP_LOGD("watchdog", "BLE reconnect already in progress");
-          }
-
-  # Heartbeat (연결 유지) — 30초 간격 + write 실패 감지
-  - interval: 30s
     then:
       - lambda: |-
           if (!id(${desk_id}_ble_enabled) || !id(${desk_id}_ble_client)->connected() || id(${desk_id}_handle_move) == 0) return;
           if (id(${desk_id}_moving_to_target)) return;
           uint8_t val[] = {0x01, 0x80};
-          auto err = esp_ble_gattc_write_char(
+          esp_ble_gattc_write_char(
             id(${desk_id}_ble_client)->get_gattc_if(),
             id(${desk_id}_ble_client)->get_conn_id(),
             id(${desk_id}_handle_move), sizeof(val), val,
             ESP_GATT_WRITE_TYPE_NO_RSP, ESP_GATT_AUTH_REQ_NO_MITM);
-          if (err != ESP_OK) {
-            ESP_LOGW("watchdog", "Heartbeat write failed (err=%d), forcing reconnect", err);
-            if (!id(${desk_id}_ble_reconnect_in_progress)) {
-              id(${desk_id}_ble_reconnect_attempts) += 1;
-              id(${desk_id}_force_ble_reconnect).execute();
-            }
-            return;
-          }
-
-          // LINAK may stop height notifications while idle. Keep the GATT link
-          // warm with a light height read instead of disconnecting.
-          uint32_t last = id(${desk_id}_last_notify_ms);
-          if (id(${desk_id}_handle_0021) != 0 && (last == 0 || millis() - last > 60000)) {
-            auto read_err = esp_ble_gattc_read_char(
-              id(${desk_id}_ble_client)->get_gattc_if(),
-              id(${desk_id}_ble_client)->get_conn_id(),
-              id(${desk_id}_handle_0021),
-              ESP_GATT_AUTH_REQ_NO_MITM);
-            if (read_err != ESP_OK) {
-              ESP_LOGW("watchdog", "Idle height read failed (err=%d)", read_err);
-            } else {
-              ESP_LOGD("watchdog", "Idle height read probe requested");
-            }
-          }
-
-  # Watchdog — 2분마다 높이 업데이트 수신 여부 확인 (3단계 에스컬레이션)
-  # Idle 상태에서는 LINAK이 notify를 멈출 수 있으므로 15분까지 허용
-  # 이동 중에는 30초 이상 높이 업데이트가 없으면 빠르게 복구 시도
-  - interval: 24h
-    then:
-      - lambda: |-
-          return;
-          if (!id(${desk_id}_ble_enabled) || !id(${desk_id}_ble_client)->connected()) return;
-          uint32_t now = millis();
-          uint32_t last = id(${desk_id}_last_notify_ms);
-          if (last == 0) return;
-          uint32_t elapsed = now - last;
-          uint8_t stage = id(${desk_id}_watchdog_stage);
-
-          ESP_LOGD("watchdog", "Notify age: %us, stage: %u, heap: %u", elapsed / 1000, stage, esp_get_free_heap_size());
-
-          bool moving = id(${desk_id}_moving_to_target) || id(${desk_id}_is_moving);
-          uint32_t stale_limit = moving ? 30000 : 900000;
-          if (elapsed <= stale_limit) return;
-
-          if (stage == 0) {
-            // Stage 1: ESPHome 레벨 disconnect
-            ESP_LOGW("watchdog", "No height update for %us (%s) — Stage 1: ESPHome disconnect",
-                     elapsed / 1000, moving ? "moving" : "idle");
-            id(${desk_id}_watchdog_stage) = 1;
-            id(${desk_id}_last_notify_ms) = now;  // 타이머 리셋
-            id(${desk_id}_ble_client)->disconnect();
-          }
-          else if (stage == 1) {
-            // Stage 2: GAP 레벨 직접 disconnect (하위 레이어)
-            ESP_LOGW("watchdog", "Stage 1 failed — Stage 2: GAP disconnect");
-            id(${desk_id}_watchdog_stage) = 2;
-            id(${desk_id}_last_notify_ms) = now;
-            esp_ble_gap_disconnect(id(${desk_id}_ble_client)->get_remote_bda());
-          }
-          else if (stage == 2) {
-            // Stage 3: 최후 수단 — ESP32 재부팅
-            ESP_LOGE("watchdog", "Stage 2 failed — rebooting ESP32");
-            delay(100);
-            esp_restart();
-          }
-
-  # 힙 메모리 감시 — 메모리 부족 시 ESP32 재부팅
-  - interval: 30min
-    then:
-      - lambda: |-
-          uint32_t free_heap = esp_get_free_heap_size();
-          ESP_LOGD("watchdog", "Free heap: %u bytes", free_heap);
-          if (free_heap < 20000) {
-            ESP_LOGE("watchdog", "Critical low memory (%u bytes), rebooting ESP32", free_heap);
-            delay(100);
-            esp_restart();
-          }
 
 # ============================================================
 # Sensor
@@ -843,13 +531,6 @@ sensor:
         hex_str += buf;
       }
       ESP_LOGD("status", "[%d bytes]: %s", x.size(), hex_str.c_str());
-      id(${desk_id}_last_notify_ms) = millis();
-      id(${desk_id}_ble_seen_notify) = true;
-      id(${desk_id}_ble_fail_count) = 0;
-      id(${desk_id}_ble_no_notify_count) = 0;
-      id(${desk_id}_ble_reconnect_in_progress) = false;
-      id(${desk_id}_ble_pairing_required) = false;
-      id(${desk_id}_watchdog_stage) = 0;
 
       if (x.size() < 2 || x[0] != 0x01) return {};
 
@@ -923,33 +604,26 @@ sensor:
 
       return {};
 
-  # 높이 센서 (0021 notify) — internal, template 센서에서 마지막 값 유지
+  # 높이 센서 (0021 notify)
   - platform: ble_client
     type: characteristic
     ble_client_id: ${desk_id}_ble_client
-    id: ${desk_id}_height_raw
-    internal: true
+    name: "${dpi1c_desk} Height"
+    id: ${desk_id}_height
     service_uuid: '99fa0020-338a-1024-8a49-009c0215f78a'
     characteristic_uuid: '99fa0021-338a-1024-8a49-009c0215f78a'
     notify: true
     update_interval: never
     unit_of_measurement: 'cm'
     accuracy_decimals: 1
+    icon: 'mdi:human-male-height'
     lambda: |-
       if (x.size() >= 4) {
-        id(${desk_id}_last_notify_ms) = millis();
-        id(${desk_id}_ble_seen_notify) = true;
-        id(${desk_id}_ble_fail_count) = 0;
-        id(${desk_id}_ble_no_notify_count) = 0;
-        id(${desk_id}_ble_reconnect_in_progress) = false;
-        id(${desk_id}_ble_pairing_required) = false;
-        id(${desk_id}_watchdog_stage) = 0;
         uint16_t raw_height = (x[1] << 8) | x[0];
         int16_t raw_speed = (x[3] << 8) | x[2];
         float height_cm = 60.0 + (raw_height / 100.0);
         float speed_mms = raw_speed / 100.0;
         id(${desk_id}_height_value) = height_cm;
-        id(${desk_id}_height).publish_state(height_cm);
         id(${desk_id}_speed).publish_state(speed_mms);
 
         // 물리버튼 조작 감지: 이동 중 반대 방향 움직임
@@ -977,15 +651,6 @@ sensor:
       }
       return {};
 
-  # 외부 노출 높이 센서 (template) — BLE 끊김에도 마지막 값 유지
-  - platform: template
-    name: "${dpi1c_desk} Height"
-    id: ${desk_id}_height
-    unit_of_measurement: 'cm'
-    accuracy_decimals: 1
-    icon: 'mdi:human-male-height'
-    update_interval: never
-
   # 속도 센서
   - platform: template
     name: "${dpi1c_desk} Speed"
@@ -993,114 +658,6 @@ sensor:
     unit_of_measurement: 'mm/s'
     accuracy_decimals: 1
     icon: 'mdi:speedometer'
-
-  # ESP/HA 진단: HA API, Wi-Fi, 업타임을 같이 보면 끊김 계층을 분리할 수 있음
-  - platform: template
-    name: "${dpi1c_desk} API Disconnected For"
-    id: ${desk_id}_api_disconnected_for
-    unit_of_measurement: 's'
-    accuracy_decimals: 0
-    entity_category: diagnostic
-    icon: 'mdi:lan-disconnect'
-    lambda: |-
-      if (id(${desk_id}_api_connected)) return 0.0f;
-      uint32_t since = id(${desk_id}_api_disconnected_since);
-      if (since == 0) return NAN;
-      return (float)(millis() - since) / 1000.0f;
-    update_interval: 30s
-
-  - platform: template
-    name: "${dpi1c_desk} API Disconnect Count"
-    id: ${desk_id}_api_disconnect_count_sensor
-    accuracy_decimals: 0
-    entity_category: diagnostic
-    icon: 'mdi:counter'
-    lambda: |-
-      return (float)id(${desk_id}_api_disconnect_count);
-    update_interval: 60s
-
-  - platform: wifi_signal
-    name: "${dpi1c_desk} WiFi Signal"
-    id: ${desk_id}_wifi_signal
-    entity_category: diagnostic
-    update_interval: 60s
-
-  - platform: uptime
-    name: "${dpi1c_desk} Uptime"
-    id: ${desk_id}_uptime
-    entity_category: diagnostic
-    update_interval: 60s
-
-  # Watchdog 진단: 마지막 BLE notify 이후 경과 시간
-  - platform: template
-    name: "${dpi1c_desk} BLE Last Notify"
-    id: ${desk_id}_ble_last_notify
-    unit_of_measurement: 's'
-    accuracy_decimals: 0
-    entity_category: diagnostic
-    icon: 'mdi:heart-pulse'
-    lambda: |-
-      uint32_t last = id(${desk_id}_last_notify_ms);
-      if (last == 0) return NAN;
-      uint32_t age = (millis() - last) / 1000;
-      if (age > id(${desk_id}_ble_last_notify_age_max)) {
-        id(${desk_id}_ble_last_notify_age_max) = age;
-      }
-      return (float)age;
-    update_interval: 30s
-
-  # Watchdog 진단: ESP32 여유 힙 메모리
-  - platform: template
-    name: "${dpi1c_desk} BLE Reconnect Attempts"
-    id: ${desk_id}_ble_reconnect_attempts_sensor
-    accuracy_decimals: 0
-    entity_category: diagnostic
-    icon: 'mdi:counter'
-    lambda: |-
-      return (float)id(${desk_id}_ble_reconnect_attempts);
-    update_interval: 60s
-
-  - platform: template
-    name: "${dpi1c_desk} BLE Fail Count"
-    id: ${desk_id}_ble_fail_count_sensor
-    accuracy_decimals: 0
-    entity_category: diagnostic
-    icon: 'mdi:counter'
-    lambda: |-
-      return (float)id(${desk_id}_ble_fail_count);
-    update_interval: 60s
-
-  - platform: template
-    name: "${dpi1c_desk} BLE No Notify Count"
-    id: ${desk_id}_ble_no_notify_count_sensor
-    accuracy_decimals: 0
-    entity_category: diagnostic
-    icon: 'mdi:counter'
-    lambda: |-
-      return (float)id(${desk_id}_ble_no_notify_count);
-    update_interval: 60s
-
-  - platform: template
-    name: "${dpi1c_desk} BLE Last Notify Age Max"
-    id: ${desk_id}_ble_last_notify_age_max_sensor
-    unit_of_measurement: 's'
-    accuracy_decimals: 0
-    entity_category: diagnostic
-    icon: 'mdi:timer-alert-outline'
-    lambda: |-
-      return (float)id(${desk_id}_ble_last_notify_age_max);
-    update_interval: 60s
-
-  - platform: template
-    name: "${dpi1c_desk} Free Heap"
-    id: ${desk_id}_free_heap
-    unit_of_measurement: 'bytes'
-    accuracy_decimals: 0
-    entity_category: diagnostic
-    icon: 'mdi:memory'
-    lambda: |-
-      return (float)esp_get_free_heap_size();
-    update_interval: 60s
 
   # 프리셋 높이 표시 센서
   - platform: template
@@ -1146,46 +703,6 @@ text_sensor:
     id: ${desk_id}_motor_direction
     update_interval: never
 
-  - platform: template
-    name: "${dpi1c_desk} Reset Reason"
-    id: ${desk_id}_reset_reason
-    entity_category: diagnostic
-    icon: 'mdi:restart-alert'
-    lambda: |-
-      switch (esp_reset_reason()) {
-        case ESP_RST_POWERON: return {"POWERON"};
-        case ESP_RST_EXT: return {"EXTERNAL"};
-        case ESP_RST_SW: return {"SOFTWARE"};
-        case ESP_RST_PANIC: return {"PANIC"};
-        case ESP_RST_INT_WDT: return {"INT_WDT"};
-        case ESP_RST_TASK_WDT: return {"TASK_WDT"};
-        case ESP_RST_WDT: return {"WDT"};
-        case ESP_RST_DEEPSLEEP: return {"DEEPSLEEP"};
-        case ESP_RST_BROWNOUT: return {"BROWNOUT"};
-        case ESP_RST_SDIO: return {"SDIO"};
-        default: return {"UNKNOWN"};
-      }
-    update_interval: 60s
-
-  - platform: version
-    name: "${dpi1c_desk} ESPHome Version"
-    id: ${desk_id}_esphome_version
-    entity_category: diagnostic
-
-  - platform: wifi_info
-    ip_address:
-      name: "${dpi1c_desk} IP Address"
-      id: ${desk_id}_ip_address
-      entity_category: diagnostic
-    ssid:
-      name: "${dpi1c_desk} Connected SSID"
-      id: ${desk_id}_connected_ssid
-      entity_category: diagnostic
-    bssid:
-      name: "${dpi1c_desk} Connected BSSID"
-      id: ${desk_id}_connected_bssid
-      entity_category: diagnostic
-
 # ============================================================
 # Binary Sensor
 # ============================================================
@@ -1195,53 +712,10 @@ binary_sensor:
     id: ${desk_id}_moving
     lambda: 'return id(${desk_id}_is_moving);'
 
-  - platform: template
-    name: "${dpi1c_desk} API Connected"
-    id: ${desk_id}_api_connected_sensor
-    entity_category: diagnostic
-    lambda: 'return id(${desk_id}_api_connected);'
-
-  - platform: template
-    name: "${dpi1c_desk} BLE Connected"
-    id: ${desk_id}_ble_connected_sensor
-    entity_category: diagnostic
-    lambda: 'return id(${desk_id}_ble_client)->connected();'
-
-  - platform: template
-    name: "${dpi1c_desk} BLE Notify Seen"
-    id: ${desk_id}_ble_notify_seen_sensor
-    entity_category: diagnostic
-    icon: 'mdi:bell-check'
-    lambda: 'return id(${desk_id}_ble_seen_notify);'
-
-  - platform: template
-    name: "${dpi1c_desk} BLE Watchdog Reconnect In Progress"
-    id: ${desk_id}_ble_watchdog_reconnect_in_progress
-    entity_category: diagnostic
-    icon: 'mdi:bluetooth-connect'
-    lambda: 'return id(${desk_id}_ble_reconnect_in_progress);'
-
-  - platform: template
-    name: "${dpi1c_desk} BLE Pairing Required"
-    id: ${desk_id}_ble_pairing_required_sensor
-    entity_category: diagnostic
-    icon: 'mdi:gesture-tap-button'
-    lambda: 'return id(${desk_id}_ble_pairing_required);'
-
-  - platform: status
-    name: "${dpi1c_desk} ESPHome Status"
-    id: ${desk_id}_esphome_status
-    entity_category: diagnostic
-
 # ============================================================
 # Buttons
 # ============================================================
 button:
-  - platform: restart
-    name: "${dpi1c_desk} Restart ESP"
-    id: ${desk_id}_restart_button
-    entity_category: diagnostic
-
   # 수동 Up (max raw=6500 → 125cm)
   - platform: template
     name: "${dpi1c_desk} Move Up"
@@ -1500,45 +974,19 @@ switch:
     name: "${dpi1c_desk} BLE Connection"
     id: ${desk_id}_ble_switch
     optimistic: true
-    restore_mode: ALWAYS_OFF
+    restore_mode: RESTORE_DEFAULT_ON
     turn_on_action:
       - lambda: |-
           id(${desk_id}_ble_enabled) = true;
-          id(${desk_id}_ble_pairing_required) = false;
-          id(${desk_id}_ble_no_notify_count) = 0;
-          id(${desk_id}_ble_connected_since_ms) = 0;
-          id(${desk_id}_ble_seen_notify) = false;
           ESP_LOGI("status", "Attempting BLE connection");
       - ble_client.connect: ${desk_id}_ble_client
     turn_off_action:
       - lambda: |-
           id(${desk_id}_ble_enabled) = false;
-          id(${desk_id}_ble_pairing_required) = false;
-          id(${desk_id}_ble_no_notify_count) = 0;
-          id(${desk_id}_ble_connected_since_ms) = 0;
-          id(${desk_id}_ble_seen_notify) = false;
           id(${desk_id}_is_moving) = false;
           id(${desk_id}_moving_to_target) = false;
           ESP_LOGI("status", "BLE Disconnected");
       - ble_client.disconnect: ${desk_id}_ble_client
-
-  - platform: template
-    name: "${dpi1c_desk} API Watchdog"
-    id: ${desk_id}_api_watchdog_switch
-    icon: 'mdi:lan-check'
-    entity_category: diagnostic
-    optimistic: true
-    restore_mode: RESTORE_DEFAULT_OFF
-    turn_on_action:
-      - lambda: |-
-          id(${desk_id}_api_watchdog_enabled) = true;
-          id(${desk_id}_api_disconnected_since) = 0;
-          ESP_LOGW("api_watchdog", "API watchdog enabled: ESP32 will reboot after 10 minutes without API clients");
-    turn_off_action:
-      - lambda: |-
-          id(${desk_id}_api_watchdog_enabled) = false;
-          id(${desk_id}_api_disconnected_since) = 0;
-          ESP_LOGI("api_watchdog", "API watchdog disabled");
 
   # 키잠금 (Child Lock)
   - platform: template
